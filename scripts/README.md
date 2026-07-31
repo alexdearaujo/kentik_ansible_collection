@@ -22,7 +22,9 @@ The script runs in three phases, in order:
    field by field so the log line for that update names exactly what's changing;
    see [Device update visibility](#device-update-visibility).
 3. **Labels**: create Kentik labels from NetBox device roles, tenants, and tags,
-   then assign the relevant labels to each device.
+   then assign the relevant labels to each device. Which of those three sources are
+   used, and whether each one's name or slug becomes the label text, is configurable;
+   see [Label sources](#label-sources).
 
 ### NMS agent detection
 
@@ -97,6 +99,32 @@ created with the current list, and an existing site whose network list has drift
 (a container prefix was added, removed, or its site changed) is updated to match.
 `infrastructureNetworks` and `otherNetworks` are never touched by this script.
 
+### Label sources
+
+By default, Phase 3 creates a Kentik label for every NetBox device role, tenant, and
+tag (by slug) and assigns the relevant ones to each device. `--label-sources` (or
+`KENTIK_LABEL_SOURCES`) overrides which of those three are used, and whether each
+one's `name` or `slug` becomes the label text, as comma-separated `source:field`
+pairs:
+
+```bash
+# Default (explicit): role, tenant, and tag labels, all keyed by slug
+uv run --env-file .env python scripts/netbox_sync.py --label-sources "role:slug,tenant:slug,tag:slug"
+
+# Only role and tenant labels; tags are never created or assigned
+uv run --env-file .env python scripts/netbox_sync.py --label-sources "role:slug,tenant:slug"
+
+# Role by slug, tenant by its full name instead
+uv run --env-file .env python scripts/netbox_sync.py --label-sources "role:slug,tenant:name"
+```
+
+A source left out of the spec entirely (like `tag` in the second example) is skipped
+completely: no label is created for it, and no device is scanned for it during
+assignment. This is a config change, not a code change, so which sources are used
+and how they're labeled can be adjusted without touching the script. A spec naming an
+unsupported source (only `role`, `tenant`, and `tag` are valid) or field (only `name`
+and `slug` are valid) is rejected at startup with a clear error.
+
 ## Requirements
 
 This repo uses [uv](https://docs.astral.sh/uv/) to manage the Python environment.
@@ -149,6 +177,7 @@ wins if both are given.
 | `KENTIK_SYNC_ONLY` | `--only` | No | Run a single phase; see [Running a single phase](#running-a-single-phase) |
 | `NETBOX_INSECURE_TLS` | `--netbox-insecure-tls` | No | Skip TLS verification on NetBox requests (lab/self-signed instances only) |
 | `KENTIK_SITE_NAME_TEMPLATE` | `--site-name-template` | No (default `{name}`) | Kentik site title template; see [Site naming](#site-naming) |
+| `KENTIK_LABEL_SOURCES` | `--label-sources` | No (default `role:slug,tenant:slug,tag:slug`) | Which NetBox objects become labels, and name vs. slug; see [Label sources](#label-sources) |
 
 Boolean env vars (`DRY_RUN`, `NETBOX_INSECURE_TLS`) accept `1`, `true`, `yes`, or `on`
 (case-insensitive); anything else is treated as false.
@@ -279,10 +308,10 @@ uv run --env-file .env python scripts/netbox_sync.py --only labels
 uv run --env-file .env python scripts/netbox_sync.py --only labels --skip-label-assignment
 ```
 
-`--skip-label-assignment` creates role/tenant/tag labels in Kentik as usual but never
-assigns them to any device. It also skips resolving device IDs entirely, since that
-work only exists to support assignment. Useful for making sure the label set exists
-in Kentik without touching any device.
+`--skip-label-assignment` creates labels in Kentik as usual (from whichever sources
+`--label-sources` selects) but never assigns them to any device. It also skips
+resolving device IDs entirely, since that work only exists to support assignment.
+Useful for making sure the label set exists in Kentik without touching any device.
 
 ## More examples
 

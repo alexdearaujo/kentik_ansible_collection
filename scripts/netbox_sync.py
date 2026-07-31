@@ -38,6 +38,8 @@ Configuration (env vars or CLI flags):
   KENTIK_SITE_NAME_TEMPLATE
                         Kentik site title template      --site-name-template
                         (default: '{name}')
+  KENTIK_LABEL_SOURCES  Which NetBox objects become      --label-sources
+                        labels, name vs. slug (see below)
 
 NMS agent detection:
   If a device carries a NetBox tag named 'kentik_primary_agent=<agentId>' it is flagged
@@ -80,10 +82,10 @@ Running a single phase:
   Kentik-side phase(s) run is affected.
 
 Skipping label assignment:
-  --skip-label-assignment creates role/tenant/tag labels in Kentik as usual but never
-  assigns them to any device. This also skips resolving device IDs entirely (no
-  per-device lookup), since that work only exists to support assignment. Combine with
-  --only labels to do nothing but ensure the label set exists in Kentik.
+  --skip-label-assignment creates labels in Kentik as usual but never assigns them to
+  any device. This also skips resolving device IDs entirely (no per-device lookup),
+  since that work only exists to support assignment. Combine with --only labels to do
+  nothing but ensure the label set exists in Kentik.
 
 Network errors:
   A transient network failure (DNS, connection refused/unreachable, timeout) talking
@@ -124,6 +126,15 @@ Site naming:
   device records only carry their site's plain name (not region/group/tenant), so
   this mapping is resolved once from the full site list and reused wherever a
   device's site needs to be looked up.
+
+Label sources:
+  --label-sources controls which NetBox objects become Kentik labels (Phase 3) and
+  whether each one's name or slug is used as the label text, as comma-separated
+  "source:field" pairs, e.g. "role:slug,tenant:name". Sources: role, tenant, tag.
+  Fields: name, slug. A source left out of the spec entirely is neither created nor
+  assigned (e.g. "role:slug,tenant:slug" drops tags without touching the code).
+  Default: "role:slug,tenant:slug,tag:slug" (today's behavior). A spec referencing an
+  unsupported source or field is rejected at startup.
 """
 
 import argparse
@@ -150,6 +161,43 @@ SITE_NAME_TEMPLATE_FIELDS = (
     "group", "group_slug",
     "tenant", "tenant_slug",
 )
+
+# NetBox object types --label-sources may draw labels from, and the fields
+# each one may be keyed by; see parse_label_sources().
+LABEL_SOURCES = ("role", "tenant", "tag")
+LABEL_SOURCE_FIELDS = ("name", "slug")
+DEFAULT_LABEL_SOURCES_SPEC = "role:slug,tenant:slug,tag:slug"
+
+
+def parse_label_sources(spec):
+    """Parse a --label-sources spec (e.g. "role:slug,tenant:name") into an
+    ordered {source: field} dict.
+
+    A source left out of spec entirely is neither created nor assigned as a
+    label; this is how e.g. tags can be dropped without touching the code.
+    Raises ValueError with a message naming exactly what's wrong, so callers
+    can turn that into a clean startup exit instead of a stack trace.
+    """
+    sources = {}
+    for entry in spec.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        source, sep, field = entry.partition(":")
+        source, field = source.strip(), field.strip()
+        if not sep:
+            raise ValueError(f"invalid --label-sources entry '{entry}': expected 'source:field'")
+        if source not in LABEL_SOURCES:
+            raise ValueError(
+                f"unknown label source '{source}' in --label-sources. Supported: {', '.join(LABEL_SOURCES)}"
+            )
+        if field not in LABEL_SOURCE_FIELDS:
+            raise ValueError(
+                f"unknown label field '{field}' for source '{source}' in --label-sources. "
+                f"Supported: {', '.join(LABEL_SOURCE_FIELDS)}"
+            )
+        sources[source] = field
+    return sources
 
 
 # ---------------------------------------------------------------------------
@@ -206,6 +254,14 @@ def get_config():
                              f"fields {', '.join('{' + f + '}' for f in SITE_NAME_TEMPLATE_FIELDS)}. "
                              "A site missing a field the template references falls back to its "
                              "plain NetBox name. Default: '{name}' (unchanged).")
+    parser.add_argument("--label-sources",
+                        default=os.environ.get("KENTIK_LABEL_SOURCES", DEFAULT_LABEL_SOURCES_SPEC),
+                        help="Comma-separated 'source:field' pairs selecting which NetBox "
+                             f"objects ({', '.join(LABEL_SOURCES)}) become Kentik labels and "
+                             f"whether each uses its name or slug as the label text. A source "
+                             "left out entirely is neither created nor assigned "
+                             f"(e.g. 'role:slug,tenant:slug' drops tags). Default: "
+                             f"'{DEFAULT_LABEL_SOURCES_SPEC}' (today's behavior).")
     cfg = parser.parse_args()
 
     missing = [name for name, attr in [
@@ -231,6 +287,11 @@ def get_config():
             f"--site-name-template references unknown field(s): {', '.join(sorted(unknown_fields))}. "
             f"Supported fields: {', '.join(SITE_NAME_TEMPLATE_FIELDS)}"
         )
+
+    try:
+        parse_label_sources(cfg.label_sources)
+    except ValueError as exc:
+        sys.exit(f"--label-sources: {exc}")
 
     return cfg
 
@@ -970,9 +1031,24 @@ def lookup_device_ids(kentik, netbox_devices, failures=None):
     return device_ids
 
 
+def _label_key(value):
+    """Normalize a label's display text into label_cache's lookup key, the
+    same way KentikClient.ensure_label does (name.lower()). Returns None for
+    a missing/empty value so callers can skip it with a plain 'in' check.
+    """
+    return value.lower() if value else None
+
+
 def sync_labels(kentik, netbox_devices, netbox_roles, netbox_tenants, netbox_tags, device_ids,
-                 limit=None, skip_assignment=False, failures=None):
+                 limit=None, skip_assignment=False, failures=None, label_sources=None):
     """Create labels from NetBox metadata and, unless skip_assignment, assign them to devices.
+
+    label_sources is an ordered {source: field} dict from parse_label_sources
+    (default DEFAULT_LABEL_SOURCES_SPEC, i.e. role/tenant/tag all keyed by
+    slug -- today's behavior). A source missing from the dict is neither
+    created nor assigned; the field ("name" or "slug") controls which NetBox
+    attribute becomes the label's display text, for both creation and the
+    device-assignment lookup.
 
     device_ids may be None, meaning Phase 2 did not just run (e.g. --only
     labels); in that case each device's Kentik ID is resolved individually
@@ -988,6 +1064,8 @@ def sync_labels(kentik, netbox_devices, netbox_roles, netbox_tenants, netbox_tag
     created = 0
     if failures is None:
         failures = []
+    if label_sources is None:
+        label_sources = parse_label_sources(DEFAULT_LABEL_SOURCES_SPEC)
 
     def ensure_within_budget(name, color):
         nonlocal created
@@ -1005,21 +1083,42 @@ def sync_labels(kentik, netbox_devices, netbox_roles, netbox_tenants, netbox_tag
             created += 1
 
     # --- Create labels ---
-    log.info("Ensuring role labels...")
-    for role in netbox_roles:
-        color = f"#{role.get('color', '808080')}"
-        ensure_within_budget(role["slug"], color)
+    if "role" in label_sources:
+        field = label_sources["role"]
+        log.info("Ensuring role labels (using %s)...", field)
+        for role in netbox_roles:
+            value = role.get(field)
+            if not value:
+                continue
+            color = f"#{role.get('color', '808080')}"
+            ensure_within_budget(value, color)
+    else:
+        log.info("Skipping role labels (not in --label-sources)")
 
-    log.info("Ensuring tenant labels...")
-    for tenant in netbox_tenants:
-        ensure_within_budget(tenant["slug"], "#00ff00")
+    if "tenant" in label_sources:
+        field = label_sources["tenant"]
+        log.info("Ensuring tenant labels (using %s)...", field)
+        for tenant in netbox_tenants:
+            value = tenant.get(field)
+            if not value:
+                continue
+            ensure_within_budget(value, "#00ff00")
+    else:
+        log.info("Skipping tenant labels (not in --label-sources)")
 
-    log.info("Ensuring tag labels...")
-    for tag in netbox_tags:
-        if tag.get("name", "").startswith(NMS_AGENT_TAG):
-            continue  # internal control tag, not a metadata label
-        color = f"#{tag.get('color', '808080')}"
-        ensure_within_budget(tag["slug"], color)
+    if "tag" in label_sources:
+        field = label_sources["tag"]
+        log.info("Ensuring tag labels (using %s)...", field)
+        for tag in netbox_tags:
+            if tag.get("name", "").startswith(NMS_AGENT_TAG):
+                continue  # internal control tag, not a metadata label
+            value = tag.get(field)
+            if not value:
+                continue
+            color = f"#{tag.get('color', '808080')}"
+            ensure_within_budget(value, color)
+    else:
+        log.info("Skipping tag labels (not in --label-sources)")
 
     # --- Assign labels to devices ---
     if skip_assignment:
@@ -1048,22 +1147,24 @@ def sync_labels(kentik, netbox_devices, netbox_roles, netbox_tenants, netbox_tag
 
         desired = []
 
-        if nb_device.get("role"):
-            slug = nb_device["role"]["slug"]
-            if slug in label_cache:
-                desired.append(label_cache[slug])
+        if "role" in label_sources and nb_device.get("role"):
+            key = _label_key(nb_device["role"].get(label_sources["role"]))
+            if key in label_cache:
+                desired.append(label_cache[key])
 
-        if nb_device.get("tenant"):
-            slug = nb_device["tenant"]["slug"]
-            if slug in label_cache:
-                desired.append(label_cache[slug])
+        if "tenant" in label_sources and nb_device.get("tenant"):
+            key = _label_key(nb_device["tenant"].get(label_sources["tenant"]))
+            if key in label_cache:
+                desired.append(label_cache[key])
 
-        for tag in nb_device.get("tags", []):
-            if tag.get("name", "").startswith(NMS_AGENT_TAG):
-                continue
-            slug = tag.get("slug", "")
-            if slug in label_cache:
-                desired.append(label_cache[slug])
+        if "tag" in label_sources:
+            field = label_sources["tag"]
+            for tag in nb_device.get("tags", []):
+                if tag.get("name", "").startswith(NMS_AGENT_TAG):
+                    continue
+                key = _label_key(tag.get(field))
+                if key in label_cache:
+                    desired.append(label_cache[key])
 
         if not desired:
             continue
@@ -1171,7 +1272,8 @@ def main():
 
     if run_labels:
         sync_labels(kentik, netbox_devices, netbox_roles, netbox_tenants, netbox_tags, device_ids,
-                    limit=cfg.limit, skip_assignment=cfg.skip_label_assignment, failures=failures)
+                    limit=cfg.limit, skip_assignment=cfg.skip_label_assignment, failures=failures,
+                    label_sources=parse_label_sources(cfg.label_sources))
 
     if failures:
         log.error("Sync completed with %d failure(s):", len(failures))

@@ -147,6 +147,40 @@ class TestResolveSiteName:
         assert ns.resolve_site_name(site, "{region}-{name}") == "West-Riverside"
 
 
+class TestParseLabelSources:
+    def test_default_spec_includes_all_three_by_slug(self):
+        assert ns.parse_label_sources(ns.DEFAULT_LABEL_SOURCES_SPEC) == {
+            "role": "slug", "tenant": "slug", "tag": "slug",
+        }
+
+    def test_drops_a_source_left_out_of_the_spec(self):
+        assert ns.parse_label_sources("role:slug,tenant:slug") == {"role": "slug", "tenant": "slug"}
+
+    def test_supports_name_field(self):
+        assert ns.parse_label_sources("tenant:name") == {"tenant": "name"}
+
+    def test_ignores_surrounding_whitespace(self):
+        assert ns.parse_label_sources(" role : slug , tenant : name ") == {"role": "slug", "tenant": "name"}
+
+    def test_ignores_empty_entries(self):
+        assert ns.parse_label_sources("role:slug,,tenant:slug,") == {"role": "slug", "tenant": "slug"}
+
+    def test_empty_spec_yields_no_sources(self):
+        assert ns.parse_label_sources("") == {}
+
+    def test_rejects_unknown_source(self):
+        with pytest.raises(ValueError, match="unknown label source 'device'"):
+            ns.parse_label_sources("device:slug")
+
+    def test_rejects_unknown_field(self):
+        with pytest.raises(ValueError, match="unknown label field 'id'"):
+            ns.parse_label_sources("role:id")
+
+    def test_rejects_entry_missing_a_colon(self):
+        with pytest.raises(ValueError, match="invalid --label-sources entry 'role'"):
+            ns.parse_label_sources("role")
+
+
 class TestFormatFailuresTable:
     def test_renders_box_drawing_table_with_header_and_rows(self):
         failures = [
@@ -315,6 +349,31 @@ class TestGetConfigSiteNameTemplate:
                                                           "--site-name-template", "{region_slug}-{name}"])
         cfg = ns.get_config()
         assert cfg.site_name_template == "{region_slug}-{name}"
+
+
+class TestGetConfigLabelSources:
+    def test_defaults_to_role_tenant_tag_by_slug(self, monkeypatch):
+        monkeypatch.setattr(sys, "argv", CONFIG_ARGV + ["--only", "sites"])
+        cfg = ns.get_config()
+        assert cfg.label_sources == "role:slug,tenant:slug,tag:slug"
+
+    def test_accepts_a_custom_spec(self, monkeypatch):
+        monkeypatch.setattr(sys, "argv", CONFIG_ARGV + ["--only", "sites",
+                                                          "--label-sources", "role:slug,tenant:name"])
+        cfg = ns.get_config()
+        assert cfg.label_sources == "role:slug,tenant:name"
+
+    def test_rejects_an_unknown_source(self, monkeypatch):
+        monkeypatch.setattr(sys, "argv", CONFIG_ARGV + ["--only", "sites",
+                                                          "--label-sources", "device:slug"])
+        with pytest.raises(SystemExit, match="unknown label source 'device'"):
+            ns.get_config()
+
+    def test_rejects_an_unknown_field(self, monkeypatch):
+        monkeypatch.setattr(sys, "argv", CONFIG_ARGV + ["--only", "sites",
+                                                          "--label-sources", "role:id"])
+        with pytest.raises(SystemExit, match="unknown label field 'id'"):
+            ns.get_config()
 
 
 # ---------------------------------------------------------------------------
@@ -1107,6 +1166,75 @@ class TestSyncLabelsFailures:
         assert failures == [{"phase": "labels: assign", "item": "bad-rtr", "reason": "kentik unreachable"}]
 
 
+class TestSyncLabelsSources:
+    def test_default_matches_role_tenant_tag_by_slug(self):
+        # label_sources=None should behave exactly like the old hardcoded
+        # role/tenant/tag-by-slug pipeline.
+        kentik = MagicMock()
+        kentik.get_labels.return_value = {}
+        roles = [{"slug": "core", "color": "ff0000"}]
+        tenants = [{"slug": "acme"}]
+        tags = [{"slug": "prod", "color": "00ff00"}]
+        ns.sync_labels(kentik, netbox_devices=[], netbox_roles=roles, netbox_tenants=tenants,
+                        netbox_tags=tags, device_ids={}, limit=None)
+        created_names = {call.args[0] for call in kentik.ensure_label.call_args_list}
+        assert created_names == {"core", "acme", "prod"}
+
+    def test_dropping_tag_source_creates_no_tag_labels(self):
+        kentik = MagicMock()
+        kentik.get_labels.return_value = {}
+        tags = [{"slug": "prod", "color": "00ff00"}]
+        ns.sync_labels(kentik, netbox_devices=[], netbox_roles=[], netbox_tenants=[],
+                        netbox_tags=tags, device_ids={}, limit=None,
+                        label_sources=ns.parse_label_sources("role:slug,tenant:slug"))
+        kentik.ensure_label.assert_not_called()
+
+    def test_dropping_tag_source_never_assigns_a_tag_label(self):
+        kentik = MagicMock()
+        kentik.get_labels.return_value = {"prod": "99"}
+        kentik.get_device_label_ids.return_value = []
+        devices = [{"name": "rtr1", "role": None, "tenant": None, "tags": [{"slug": "prod"}]}]
+        ns.sync_labels(kentik, netbox_devices=devices, netbox_roles=[], netbox_tenants=[],
+                        netbox_tags=[], device_ids={"rtr1": "1"}, limit=None,
+                        label_sources=ns.parse_label_sources("role:slug,tenant:slug"))
+        kentik.get_device_label_ids.assert_not_called()  # nothing desired -> free, never touched
+
+    def test_tenant_by_name_creates_and_assigns_using_the_name(self):
+        kentik = MagicMock()
+        kentik.get_labels.return_value = {"acme corp": "50"}
+        kentik.get_device_label_ids.return_value = []
+        devices = [{"name": "rtr1", "role": None, "tenant": {"name": "Acme Corp", "slug": "acme"}, "tags": []}]
+        ns.sync_labels(kentik, netbox_devices=devices, netbox_roles=[], netbox_tenants=[{"name": "Acme Corp", "slug": "acme"}],
+                        netbox_tags=[], device_ids={"rtr1": "1"}, limit=None,
+                        label_sources=ns.parse_label_sources("tenant:name"))
+        # Created using the raw display value...
+        kentik.ensure_label.assert_called_once_with("Acme Corp", "#00ff00", kentik.get_labels.return_value)
+        # ...and matched for assignment via the same case-folded key ensure_label uses.
+        kentik.set_device_labels.assert_called_once_with("1", ["50"])
+
+    def test_role_by_name_does_not_match_a_device_whose_role_name_differs_in_case(self):
+        # Sanity check that matching really is case-insensitive end to end,
+        # not just coincidentally working because slugs are lowercase.
+        kentik = MagicMock()
+        kentik.get_labels.return_value = {"core switch": "77"}
+        kentik.get_device_label_ids.return_value = []
+        devices = [{"name": "rtr1", "role": {"name": "CORE SWITCH", "slug": "core-switch"}, "tenant": None, "tags": []}]
+        ns.sync_labels(kentik, netbox_devices=devices, netbox_roles=[], netbox_tenants=[],
+                        netbox_tags=[], device_ids={"rtr1": "1"}, limit=None,
+                        label_sources=ns.parse_label_sources("role:name"))
+        kentik.set_device_labels.assert_called_once_with("1", ["77"])
+
+    def test_empty_sources_creates_and_assigns_nothing(self):
+        kentik = MagicMock()
+        kentik.get_labels.return_value = {}
+        roles = [{"slug": "core", "color": "ff0000"}]
+        devices = [{"name": "rtr1", "role": {"slug": "core"}, "tenant": None, "tags": []}]
+        ns.sync_labels(kentik, netbox_devices=devices, netbox_roles=roles, netbox_tenants=[],
+                        netbox_tags=[], device_ids={"rtr1": "1"}, limit=None, label_sources={})
+        kentik.ensure_label.assert_not_called()
+        kentik.get_device_label_ids.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # End-to-end
 # ---------------------------------------------------------------------------
@@ -1409,3 +1537,35 @@ class TestEndToEnd:
         create_calls = [r for r in requests_mock.request_history if r.method == "POST" and r.path == DEVICE_PATH]
         assert len(create_calls) == 1
         assert create_calls[0].json()["device"]["siteId"] == 55
+
+    def test_label_sources_excludes_tags_and_uses_tenant_name(self, requests_mock, monkeypatch):
+        device = {
+            "name": "rtr1",
+            "site": {"name": "DC1"},
+            "primary_ip4": {"address": "10.0.0.1/24"},
+            "role": {"slug": "core"},
+            "tenant": {"name": "Acme Corp", "slug": "acme"},
+            "tags": [{"slug": "prod", "name": "prod"}],
+            "description": "core router",
+        }
+        _register_netbox(
+            requests_mock,
+            devices=[device],
+            roles=[{"slug": "core", "color": "ff0000"}],
+            tenants=[{"name": "Acme Corp", "slug": "acme"}],
+            tags=[{"slug": "prod", "color": "00ff00"}],
+        )
+        requests_mock.get(f"{KENTIK_BASE}{LABELS_PATH}", json={"labels": []})
+        requests_mock.get(f"{KENTIK_V5}/plans", json={"plans": [{"name": "MyPlan", "id": "9"}]})
+        requests_mock.get(check_device_url("rtr1"), json={"device": {"id": "701"}})
+        requests_mock.post(f"{KENTIK_BASE}{LABELS_PATH}", json={"label": {"id": "601"}})
+        requests_mock.get(f"{KENTIK_BASE}{device_id_path('701')}", json={"device": {"labels": []}})
+        requests_mock.put(f"{KENTIK_BASE}{device_labels_path('701')}", json={})
+
+        monkeypatch.setattr(sys, "argv", BASE_ARGV + ["--only", "labels",
+                                                        "--label-sources", "role:slug,tenant:name"])
+        ns.main()
+
+        label_creates = [r.json()["label"]["name"] for r in requests_mock.request_history
+                          if r.method == "POST" and r.path == LABELS_PATH]
+        assert set(label_creates) == {"core", "Acme Corp"}  # "prod" excluded: tags dropped from sources
