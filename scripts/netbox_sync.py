@@ -273,7 +273,7 @@ class KentikClient:
         resp = kentik_request("GET", f"{self._base}/site/v202211/sites", self._h)
         if resp is None:
             raise RuntimeError("Kentik GET /site/v202211/sites returned 404: check API base URL/region")
-        return {s["title"]: s for s in resp.json().get("sites", [])}
+        return {site["title"]: site for site in resp.json().get("sites", [])}
 
     def create_site(self, title, lat=0.0, lon=0.0):
         if self.dry_run:
@@ -332,7 +332,7 @@ class KentikClient:
         resp = kentik_request("GET", f"{self._base}/label/v202210/labels", self._h)
         if resp is None:
             raise RuntimeError("Kentik GET /label/v202210/labels returned 404: check API base URL/region")
-        return {l["name"].lower(): l["id"] for l in resp.json().get("labels", [])}
+        return {label["name"].lower(): label["id"] for label in resp.json().get("labels", [])}
 
     def create_label(self, name, color):
         if self.dry_run:
@@ -437,7 +437,7 @@ class KentikClient:
         )
         if resp is None:
             raise RuntimeError(f"Kentik GET /device/v202504beta2/device/{device_id} returned 404")
-        return [lbl["id"] for lbl in resp.json()["device"].get("labels", [])]
+        return [label["id"] for label in resp.json()["device"].get("labels", [])]
 
     def set_device_labels(self, device_id, label_ids):
         if self.dry_run:
@@ -446,7 +446,7 @@ class KentikClient:
 
         payload = {
             "id": device_id,
-            "labels": [{"id": int(lid)} for lid in label_ids],
+            "labels": [{"id": int(label_id)} for label_id in label_ids],
         }
         kentik_request(
             "PUT", f"{self._base}/device/v202504beta2/device/{device_id}/labels",
@@ -480,7 +480,7 @@ def nms_agent_tag(nb_device):
     """Return agent ID string if the device carries a kentik_primary_agent=<id> tag."""
     prefix = NMS_AGENT_TAG + "="
     tags = nb_device.get("tags", [])
-    tag_names = [t.get("name", "") for t in tags]
+    tag_names = [tag.get("name", "") for tag in tags]
     log.debug("Device %s tags: %s", nb_device.get("name"), tag_names)
     for name in tag_names:
         if name.startswith(prefix):
@@ -557,19 +557,19 @@ def sync_devices(kentik, netbox_devices, site_cache, plan_id, cfg, limit=None):
     device_ids = {}
     processed = 0
 
-    for nb in netbox_devices:
+    for nb_device in netbox_devices:
         if limit is not None and processed >= limit:
             log.info("Device limit (%d) reached; stopping further device processing", limit)
             break
 
-        device_name = nb.get("name")
+        device_name = nb_device.get("name")
         if not device_name:
-            log.warning("Device id=%s has no name in NetBox (e.g. a virtual chassis member), skipping", nb.get("id"))
+            log.warning("Device id=%s has no name in NetBox (e.g. a virtual chassis member), skipping", nb_device.get("id"))
             continue
         name = device_name.lower()
 
         # Resolve site
-        nb_site = nb.get("site") or {}
+        nb_site = nb_device.get("site") or {}
         site_name = nb_site.get("name")
         if not site_name or site_name not in site_cache:
             log.warning("Device %s: site '%s' not found in Kentik, skipping", name, site_name)
@@ -577,15 +577,15 @@ def sync_devices(kentik, netbox_devices, site_cache, plan_id, cfg, limit=None):
         site_id = site_cache[site_name]
 
         # Primary IP
-        primary_ip4 = nb.get("primary_ip4")
+        primary_ip4 = nb_device.get("primary_ip4")
         ip_address = strip_cidr(primary_ip4.get("address")) if primary_ip4 else None
 
         # NMS agent
-        agent_id = nms_agent_tag(nb)
+        agent_id = nms_agent_tag(nb_device)
 
         device_obj = {
             "deviceName": name,
-            "deviceDescription": nb.get("description") or "Synced from NetBox",
+            "deviceDescription": nb_device.get("description") or "Synced from NetBox",
             "deviceSubtype": "router",
             "deviceSampleRate": cfg.sample_rate,
             "planId": int(plan_id),
@@ -637,8 +637,8 @@ def lookup_device_ids(kentik, netbox_devices):
     there's no in-memory device_ids result to reuse.
     """
     device_ids = {}
-    for nb in netbox_devices:
-        device_name = nb.get("name")
+    for nb_device in netbox_devices:
+        device_name = nb_device.get("name")
         if not device_name:
             continue
         name = device_name.lower()
@@ -704,12 +704,12 @@ def sync_labels(kentik, netbox_devices, netbox_roles, netbox_tenants, netbox_tag
 
     log.info("Assigning labels to devices...")
     assigned = 0
-    for nb in netbox_devices:
+    for nb_device in netbox_devices:
         if limit is not None and assigned >= limit:
             log.info("Device label-assignment limit (%d) reached; stopping further assignments", limit)
             break
 
-        device_name = nb.get("name")
+        device_name = nb_device.get("name")
         if not device_name:
             continue  # unnamed devices (e.g. virtual chassis members) were never synced in Phase 2
         name = device_name.lower()
@@ -719,17 +719,17 @@ def sync_labels(kentik, netbox_devices, netbox_roles, netbox_tenants, netbox_tag
 
         desired = []
 
-        if nb.get("role"):
-            slug = nb["role"]["slug"]
+        if nb_device.get("role"):
+            slug = nb_device["role"]["slug"]
             if slug in label_cache:
                 desired.append(label_cache[slug])
 
-        if nb.get("tenant"):
-            slug = nb["tenant"]["slug"]
+        if nb_device.get("tenant"):
+            slug = nb_device["tenant"]["slug"]
             if slug in label_cache:
                 desired.append(label_cache[slug])
 
-        for tag in nb.get("tags", []):
+        for tag in nb_device.get("tags", []):
             if tag.get("name", "").startswith(NMS_AGENT_TAG):
                 continue
             slug = tag.get("slug", "")
