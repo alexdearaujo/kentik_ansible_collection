@@ -57,6 +57,147 @@ class TestNmsAgentTag:
         assert ns.nms_agent_tag(device) is None
 
 
+class TestContainerPrefixesBySite:
+    def test_groups_container_prefixes_by_scoped_site(self):
+        prefixes = [
+            {"prefix": "1.1.1.0/24", "status": {"value": "container"},
+             "scope_type": "dcim.site", "scope": {"name": "DC1"}},
+            {"prefix": "2.2.2.0/24", "status": {"value": "container"},
+             "scope_type": "dcim.site", "scope": {"name": "DC1"}},
+            {"prefix": "3.3.3.0/24", "status": {"value": "container"},
+             "scope_type": "dcim.site", "scope": {"name": "DC2"}},
+        ]
+        assert ns.container_prefixes_by_site(prefixes) == {
+            "DC1": ["1.1.1.0/24", "2.2.2.0/24"],
+            "DC2": ["3.3.3.0/24"],
+        }
+
+    def test_sorts_and_dedupes_per_site(self):
+        prefixes = [
+            {"prefix": "9.9.9.0/24", "scope_type": "dcim.site", "scope": {"name": "DC1"}},
+            {"prefix": "1.1.1.0/24", "scope_type": "dcim.site", "scope": {"name": "DC1"}},
+            {"prefix": "9.9.9.0/24", "scope_type": "dcim.site", "scope": {"name": "DC1"}},
+        ]
+        assert ns.container_prefixes_by_site(prefixes) == {"DC1": ["1.1.1.0/24", "9.9.9.0/24"]}
+
+    def test_skips_prefixes_not_scoped_to_a_site(self):
+        prefixes = [
+            {"prefix": "1.1.1.0/24", "scope_type": "dcim.region", "scope": {"name": "US"}},
+            {"prefix": "2.2.2.0/24", "scope_type": None, "scope": None},
+        ]
+        assert ns.container_prefixes_by_site(prefixes) == {}
+
+
+class TestFormatFailuresTable:
+    def test_renders_box_drawing_table_with_header_and_rows(self):
+        failures = [
+            {"phase": "sites", "item": "dc1", "reason": "HTTP POST ... returned 500: boom"},
+            {"phase": "devices", "item": "rtr1", "reason": "HTTP PUT ... failed after 3 retries"},
+        ]
+        table = ns.format_failures_table(failures)
+        lines = table.splitlines()
+        assert lines[0].startswith("┌") and lines[0].endswith("┐")
+        assert lines[-1].startswith("└") and lines[-1].endswith("┘")
+        assert "Phase" in lines[1] and "Item" in lines[1] and "Reason" in lines[1]
+        assert any("sites" in line and "dc1" in line for line in lines)
+        assert any("devices" in line and "rtr1" in line for line in lines)
+        # every row is the same width, so the table columns line up
+        assert len({len(line) for line in lines}) == 1
+
+    def test_truncates_long_reasons(self):
+        failures = [{"phase": "sites", "item": "dc1", "reason": "x" * 200}]
+        table = ns.format_failures_table(failures)
+        assert "…" in table
+        assert "x" * 200 not in table
+
+    def test_empty_failures_still_renders_header(self):
+        table = ns.format_failures_table([])
+        assert "Phase" in table
+        assert "Item" in table
+        assert "Reason" in table
+
+
+class TestCleanFailureReason:
+    def test_extracts_message_from_kentik_json_error_body(self):
+        reason = (
+            'HTTP POST https://grpc.api.kentik.com/device/v202504beta2/device returned 400: '
+            '{"code":3,"message":"ValidationError: Device name (pp_mdf) Already Exists '
+            '(errxid d9p2c4gtkfgg0d9e77wg)","details":[]}'
+        )
+        cleaned = ns._clean_failure_reason(reason)
+        assert cleaned == "400: ValidationError: Device name (pp_mdf) Already Exists (errxid d9p2c4gtkfgg0d9e77wg)"
+
+    def test_falls_back_to_raw_body_when_not_json(self):
+        reason = "HTTP POST https://x.test/thing returned 500: plain text error"
+        assert ns._clean_failure_reason(reason) == "500: plain text error"
+
+    def test_leaves_non_http_reasons_unchanged(self):
+        reason = "Kentik plan 'Gold' not found"
+        assert ns._clean_failure_reason(reason) == reason
+
+    def test_leaves_retries_exhausted_message_unchanged(self):
+        reason = "HTTP PUT https://x.test/thing failed after 3 retries"
+        assert ns._clean_failure_reason(reason) == reason
+
+
+class TestDeviceFieldChanges:
+    def _existing(self, **overrides):
+        base = {
+            "deviceDescription": "Synced from NetBox",
+            "deviceSubtype": "router",
+            "deviceSampleRate": "1",
+            "deviceBgpType": "none",
+            "minimizeSnmp": False,
+            "sendingIps": [],
+            "deviceSnmpIp": "",
+            "deviceSnmpCommunity": "",
+            "site": {"id": "100"},
+            "plan": {"id": "9"},
+        }
+        base.update(overrides)
+        return base
+
+    def _desired(self, **overrides):
+        base = {
+            "deviceDescription": "Synced from NetBox",
+            "deviceSubtype": "router",
+            "deviceSampleRate": 1,
+            "planId": 9,
+            "siteId": 100,
+            "deviceBgpType": "none",
+            "minimizeSnmp": False,
+        }
+        base.update(overrides)
+        return base
+
+    def test_no_changes_when_everything_matches(self):
+        assert ns._device_field_changes(self._existing(), self._desired()) == {}
+
+    def test_detects_description_change(self):
+        changes = ns._device_field_changes(self._existing(deviceDescription="old"), self._desired())
+        assert "deviceDescription" in changes
+        assert changes["deviceDescription"] == "'old' -> 'Synced from NetBox'"
+
+    def test_detects_site_change_via_nested_site_id(self):
+        changes = ns._device_field_changes(self._existing(site={"id": "1"}), self._desired(siteId=100))
+        assert changes["siteId"] == "1 -> 100"
+
+    def test_detects_plan_change_via_nested_plan_id(self):
+        changes = ns._device_field_changes(self._existing(plan={"id": "5"}), self._desired(planId=9))
+        assert changes["planId"] == "5 -> 9"
+
+    def test_ignores_fields_not_present_in_desired(self):
+        # sendingIps isn't set on the desired device (no primary IP in NetBox);
+        # a stale value already in Kentik shouldn't be reported as a change.
+        existing = self._existing(sendingIps=["10.0.0.1"])
+        desired = self._desired()
+        assert "sendingIps" not in ns._device_field_changes(existing, desired)
+
+    def test_flags_nms_as_present_without_diffing_it(self):
+        changes = ns._device_field_changes(self._existing(), self._desired(nms={"agentId": "1"}))
+        assert changes["nms"] == "NMS agent config included (not diffed)"
+
+
 # ---------------------------------------------------------------------------
 # get_config
 # ---------------------------------------------------------------------------
@@ -443,6 +584,105 @@ class TestSyncSitesLatLon:
         assert called_obj["siteMarket"] == "west"
 
 
+class TestSyncSitesUserAccessNetworks:
+    def test_creates_site_with_container_prefixes(self):
+        kentik = MagicMock()
+        kentik.get_sites.return_value = {}
+        netbox_sites = [{"name": "DC1"}]
+        ns.sync_sites(kentik, netbox_sites, container_prefixes_by_site={"DC1": ["1.1.1.1/32", "2.2.2.2/32"]},
+                      limit=None)
+        kentik.ensure_site.assert_called_once_with(
+            title="DC1", lat=0.0, lon=0.0,
+            user_access_networks=["1.1.1.1/32", "2.2.2.2/32"], site_cache={},
+        )
+
+    def test_updates_site_when_user_access_networks_drift(self):
+        kentik = MagicMock()
+        kentik.get_sites.return_value = {
+            "DC1": {"id": "1", "lat": 0.0, "lon": 0.0,
+                    "addressClassification": {"userAccessNetworks": ["1.1.1.1/32"]}}
+        }
+        netbox_sites = [{"name": "DC1"}]
+        ns.sync_sites(kentik, netbox_sites,
+                      container_prefixes_by_site={"DC1": ["1.1.1.1/32", "2.2.2.2/32"]}, limit=None)
+        kentik.update_site.assert_called_once()
+        called_id, called_obj = kentik.update_site.call_args[0]
+        assert called_id == "1"
+        assert called_obj["addressClassification"]["userAccessNetworks"] == ["1.1.1.1/32", "2.2.2.2/32"]
+
+    def test_does_not_update_when_networks_match_regardless_of_order(self):
+        kentik = MagicMock()
+        kentik.get_sites.return_value = {
+            "DC1": {"id": "1", "lat": 0.0, "lon": 0.0,
+                    "addressClassification": {"userAccessNetworks": ["2.2.2.2/32", "1.1.1.1/32"]}}
+        }
+        netbox_sites = [{"name": "DC1"}]
+        ns.sync_sites(kentik, netbox_sites,
+                      container_prefixes_by_site={"DC1": ["1.1.1.1/32", "2.2.2.2/32"]}, limit=None)
+        kentik.update_site.assert_not_called()
+
+    def test_does_not_touch_infrastructure_or_other_networks(self):
+        kentik = MagicMock()
+        kentik.get_sites.return_value = {
+            "DC1": {"id": "1", "lat": 0.0, "lon": 0.0,
+                    "addressClassification": {
+                        "infrastructureNetworks": ["10.0.0.0/8"],
+                        "userAccessNetworks": [],
+                        "otherNetworks": ["172.16.0.0/12"],
+                    }}
+        }
+        netbox_sites = [{"name": "DC1"}]
+        ns.sync_sites(kentik, netbox_sites, container_prefixes_by_site={"DC1": ["1.1.1.1/32"]}, limit=None)
+        _, called_obj = kentik.update_site.call_args[0]
+        assert called_obj["addressClassification"]["infrastructureNetworks"] == ["10.0.0.0/8"]
+        assert called_obj["addressClassification"]["otherNetworks"] == ["172.16.0.0/12"]
+
+
+class TestSyncSitesFailures:
+    def test_failed_create_is_recorded_and_does_not_stop_other_sites(self):
+        kentik = MagicMock()
+        kentik.get_sites.return_value = {}
+        kentik.ensure_site.side_effect = [RuntimeError("boom"), "2"]
+        netbox_sites = [{"name": "bad-site"}, {"name": "good-site"}]
+        failures = []
+        ns.sync_sites(kentik, netbox_sites, limit=None, failures=failures)
+        assert kentik.ensure_site.call_count == 2
+        assert failures == [{"phase": "sites", "item": "bad-site", "reason": "boom"}]
+
+    def test_failed_update_is_recorded_and_does_not_stop_other_sites(self):
+        kentik = MagicMock()
+        kentik.get_sites.return_value = {
+            "DC1": {"id": "1", "lat": 1.0, "lon": 1.0},
+            "DC2": {"id": "2", "lat": 1.0, "lon": 1.0},
+        }
+        kentik.update_site.side_effect = RuntimeError("kentik is down")
+        netbox_sites = [
+            {"name": "DC1", "latitude": 9.0, "longitude": 9.0},
+            {"name": "DC2", "latitude": 9.0, "longitude": 9.0},
+        ]
+        failures = []
+        ns.sync_sites(kentik, netbox_sites, limit=None, failures=failures)
+        assert kentik.update_site.call_count == 2
+        assert len(failures) == 2
+        assert {f["item"] for f in failures} == {"DC1", "DC2"}
+        assert all(f["phase"] == "sites" and f["reason"] == "kentik is down" for f in failures)
+
+    def test_failed_site_does_not_consume_limit_budget(self):
+        kentik = MagicMock()
+        kentik.get_sites.return_value = {}
+        kentik.ensure_site.side_effect = [RuntimeError("boom"), "2"]
+        netbox_sites = [{"name": "bad-site"}, {"name": "good-site"}]
+        ns.sync_sites(kentik, netbox_sites, limit=1, failures=[])
+        assert kentik.ensure_site.call_count == 2
+
+    def test_no_failures_list_needed_when_not_given(self):
+        kentik = MagicMock()
+        kentik.get_sites.return_value = {}
+        kentik.ensure_site.side_effect = RuntimeError("boom")
+        # Must not raise even without a failures list passed in.
+        ns.sync_sites(kentik, [{"name": "bad-site"}], limit=None)
+
+
 class TestSyncDevicesLimit:
     def _cfg(self):
         return MagicMock(sample_rate=1, snmp_community="", snmp_credential="default")
@@ -484,6 +724,93 @@ class TestSyncDevicesLimit:
         assert "rtr1" in device_ids
 
 
+class TestSyncDevicesFailures:
+    def _cfg(self):
+        return MagicMock(sample_rate=1, snmp_community="", snmp_credential="default")
+
+    def test_failed_device_is_recorded_and_does_not_stop_other_devices(self):
+        kentik = MagicMock()
+        kentik.check_device.return_value = None
+        kentik.create_device.side_effect = [RuntimeError("rejected"), "2"]
+        site_cache = {"DC1": "100"}
+        netbox_devices = [{"name": "bad-rtr", "site": {"name": "DC1"}}, {"name": "good-rtr", "site": {"name": "DC1"}}]
+        failures = []
+        device_ids = ns.sync_devices(kentik, netbox_devices, site_cache, plan_id="7", cfg=self._cfg(),
+                                      limit=None, failures=failures)
+        assert kentik.create_device.call_count == 2
+        assert "good-rtr" in device_ids
+        assert "bad-rtr" not in device_ids
+        assert failures == [{"phase": "devices", "item": "bad-rtr", "reason": "rejected"}]
+
+    def test_failed_device_does_not_consume_limit_budget(self):
+        kentik = MagicMock()
+        kentik.check_device.return_value = None
+        kentik.create_device.side_effect = [RuntimeError("rejected"), "2"]
+        site_cache = {"DC1": "100"}
+        netbox_devices = [{"name": "bad-rtr", "site": {"name": "DC1"}}, {"name": "good-rtr", "site": {"name": "DC1"}}]
+        device_ids = ns.sync_devices(kentik, netbox_devices, site_cache, plan_id="7", cfg=self._cfg(),
+                                      limit=1, failures=[])
+        assert kentik.create_device.call_count == 2
+        assert "good-rtr" in device_ids
+
+
+class TestSyncDevicesUpdate:
+    def _cfg(self):
+        return MagicMock(sample_rate=1, snmp_community="", snmp_credential="default")
+
+    def test_fetches_existing_device_and_logs_field_diff(self, caplog):
+        kentik = MagicMock()
+        kentik.check_device.return_value = "42"
+        kentik.get_device.return_value = {
+            "deviceDescription": "old description", "deviceSubtype": "router",
+            "deviceSampleRate": "1", "deviceBgpType": "none", "minimizeSnmp": False,
+            "sendingIps": [], "deviceSnmpIp": "", "deviceSnmpCommunity": "",
+            "site": {"id": "100"}, "plan": {"id": "7"},
+        }
+        kentik.update_device.return_value = "42"
+        site_cache = {"DC1": "100"}
+        netbox_devices = [{"name": "rtr1", "site": {"name": "DC1"}, "description": "new description"}]
+
+        with caplog.at_level("INFO"):
+            device_ids = ns.sync_devices(kentik, netbox_devices, site_cache, plan_id="7", cfg=self._cfg(), limit=None)
+
+        kentik.get_device.assert_called_once_with("42")
+        kentik.update_device.assert_called_once()
+        assert device_ids["rtr1"] == "42"
+        assert "deviceDescription" in caplog.text
+        assert "'old description' -> 'new description'" in caplog.text
+
+    def test_logs_no_changes_when_device_already_matches(self, caplog):
+        kentik = MagicMock()
+        kentik.check_device.return_value = "42"
+        kentik.get_device.return_value = {
+            "deviceDescription": "Synced from NetBox", "deviceSubtype": "router",
+            "deviceSampleRate": "1", "deviceBgpType": "none", "minimizeSnmp": False,
+            "sendingIps": [], "deviceSnmpIp": "", "deviceSnmpCommunity": "",
+            "site": {"id": "100"}, "plan": {"id": "7"},
+        }
+        site_cache = {"DC1": "100"}
+        netbox_devices = [{"name": "rtr1", "site": {"name": "DC1"}}]
+
+        with caplog.at_level("INFO"):
+            ns.sync_devices(kentik, netbox_devices, site_cache, plan_id="7", cfg=self._cfg(), limit=None)
+
+        assert "no field changes detected" in caplog.text
+        kentik.update_device.assert_called_once()  # still updates; only the visibility changed
+
+    def test_failed_get_device_is_recorded_and_does_not_stop_other_devices(self):
+        kentik = MagicMock()
+        kentik.check_device.return_value = "42"
+        kentik.get_device.side_effect = RuntimeError("kentik unreachable")
+        site_cache = {"DC1": "100"}
+        netbox_devices = [{"name": "rtr1", "site": {"name": "DC1"}}]
+        failures = []
+        ns.sync_devices(kentik, netbox_devices, site_cache, plan_id="7", cfg=self._cfg(),
+                         limit=None, failures=failures)
+        kentik.update_device.assert_not_called()
+        assert failures == [{"phase": "devices", "item": "rtr1", "reason": "kentik unreachable"}]
+
+
 class TestLookupDeviceIds:
     def test_resolves_ids_for_existing_devices(self):
         kentik = MagicMock()
@@ -496,6 +823,15 @@ class TestLookupDeviceIds:
         kentik.check_device.return_value = None
         device_ids = ns.lookup_device_ids(kentik, [{"name": "rtr1"}])
         assert device_ids == {}
+
+    def test_failed_lookup_is_recorded_and_does_not_stop_other_devices(self):
+        kentik = MagicMock()
+        kentik.check_device.side_effect = [RuntimeError("kentik unreachable"), "20"]
+        netbox_devices = [{"name": "rtr1"}, {"name": "rtr2"}]
+        failures = []
+        device_ids = ns.lookup_device_ids(kentik, netbox_devices, failures=failures)
+        assert device_ids == {"rtr2": "20"}
+        assert failures == [{"phase": "labels: assign", "item": "rtr1", "reason": "kentik unreachable"}]
 
     def test_skips_unnamed_devices_without_crashing(self):
         kentik = MagicMock()
@@ -613,6 +949,43 @@ class TestSyncLabelsSkipAssignment:
         kentik.check_device.assert_not_called()
 
 
+class TestSyncLabelsFailures:
+    def test_failed_label_create_is_recorded_and_does_not_stop_other_labels(self):
+        kentik = MagicMock()
+        kentik.get_labels.return_value = {}
+        kentik.ensure_label.side_effect = [RuntimeError("rejected"), "10"]
+        roles = [{"slug": "bad-role", "color": "ff0000"}, {"slug": "good-role", "color": "00ff00"}]
+        failures = []
+        ns.sync_labels(kentik, netbox_devices=[], netbox_roles=roles, netbox_tenants=[],
+                        netbox_tags=[], device_ids={}, limit=None, failures=failures)
+        assert kentik.ensure_label.call_count == 2
+        assert failures == [{"phase": "labels: create", "item": "bad-role", "reason": "rejected"}]
+
+    def test_failed_label_create_does_not_consume_limit_budget(self):
+        kentik = MagicMock()
+        kentik.get_labels.return_value = {}
+        kentik.ensure_label.side_effect = [RuntimeError("rejected"), "10"]
+        roles = [{"slug": "bad-role", "color": "ff0000"}, {"slug": "good-role", "color": "00ff00"}]
+        ns.sync_labels(kentik, netbox_devices=[], netbox_roles=roles, netbox_tenants=[],
+                        netbox_tags=[], device_ids={}, limit=1, failures=[])
+        assert kentik.ensure_label.call_count == 2
+
+    def test_failed_assignment_is_recorded_and_does_not_stop_other_devices(self):
+        kentik = MagicMock()
+        kentik.get_labels.return_value = {"core": "10"}
+        kentik.get_device_label_ids.side_effect = [RuntimeError("kentik unreachable"), []]
+        devices = [
+            {"name": "bad-rtr", "role": {"slug": "core"}, "tenant": None, "tags": []},
+            {"name": "good-rtr", "role": {"slug": "core"}, "tenant": None, "tags": []},
+        ]
+        device_ids = {"bad-rtr": "1", "good-rtr": "2"}
+        failures = []
+        ns.sync_labels(kentik, netbox_devices=devices, netbox_roles=[], netbox_tenants=[],
+                        netbox_tags=[], device_ids=device_ids, limit=None, failures=failures)
+        assert kentik.get_device_label_ids.call_count == 2
+        assert failures == [{"phase": "labels: assign", "item": "bad-rtr", "reason": "kentik unreachable"}]
+
+
 # ---------------------------------------------------------------------------
 # End-to-end
 # ---------------------------------------------------------------------------
@@ -654,12 +1027,15 @@ def check_device_url(name):
     return f"{KENTIK_V5}/device/{name}"
 
 
-def _register_netbox(requests_mock, devices=None, sites=None, roles=None, tenants=None, tags=None):
+def _register_netbox(requests_mock, devices=None, sites=None, roles=None, tenants=None, tags=None,
+                      container_prefixes=None):
     requests_mock.get("http://netbox.test/api/dcim/sites/?limit=0", json={"results": sites or [], "next": None})
     requests_mock.get("http://netbox.test/api/dcim/devices/?limit=0", json={"results": devices or [], "next": None})
     requests_mock.get("http://netbox.test/api/dcim/device-roles/?limit=0", json={"results": roles or [], "next": None})
     requests_mock.get("http://netbox.test/api/tenancy/tenants/?limit=0", json={"results": tenants or [], "next": None})
     requests_mock.get("http://netbox.test/api/extras/tags/?limit=0", json={"results": tags or [], "next": None})
+    requests_mock.get("http://netbox.test/api/ipam/prefixes/?status=container&limit=0",
+                       json={"results": container_prefixes or [], "next": None})
 
 
 def _register_kentik_reads(requests_mock, plan_id="9", device_names=("rtr1",)):
@@ -826,3 +1202,38 @@ class TestEndToEnd:
 
         methods = [(r.method, r.path) for r in requests_mock.request_history]
         assert ("POST", SITES_PATH) in methods
+
+    def test_one_failed_device_does_not_abort_the_run(self, requests_mock, monkeypatch, capsys):
+        device_names = ["bad-rtr", "good-rtr"]
+        _register_netbox(
+            requests_mock,
+            devices=[_make_device(n) for n in device_names],
+            sites=[{"name": "DC1"}],
+        )
+        _register_kentik_reads(requests_mock, device_names=device_names)
+        requests_mock.get(f"{KENTIK_BASE}{SITES_PATH}", json={"sites": [{"title": "DC1", "id": "1"}]})
+
+        def create_device_response(request, context):
+            body = request.json()["device"]
+            if body["deviceName"] == "bad-rtr":
+                context.status_code = 500
+                return {"error": "invalid configuration"}
+            return {"device": {"id": "702"}}
+
+        requests_mock.post(f"{KENTIK_BASE}{DEVICE_PATH}", json=create_device_response)
+        requests_mock.get(f"{KENTIK_BASE}{device_id_path('702')}", json={"device": {"labels": []}})
+        requests_mock.put(f"{KENTIK_BASE}{device_labels_path('702')}", json={})
+
+        monkeypatch.setattr(sys, "argv", BASE_ARGV)
+        with pytest.raises(SystemExit) as exc_info:
+            ns.main()
+        assert exc_info.value.code == 1
+
+        create_calls = [r for r in requests_mock.request_history
+                        if r.method == "POST" and r.path == DEVICE_PATH]
+        assert len(create_calls) == 2  # both attempted; the bad one didn't stop the good one
+
+        out = capsys.readouterr().out
+        assert "devices" in out
+        assert "bad-rtr" in out
+        assert "┌" in out and "└" in out

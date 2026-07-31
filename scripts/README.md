@@ -12,9 +12,14 @@ The script runs in three phases, in order:
    already exists and NetBox has current lat/lon values that differ from what's in
    Kentik, update it (NetBox is treated as the source of truth for coordinates, but
    only when NetBox actually has a value; a NetBox site with no lat/lon set is left
-   alone rather than zeroing out a real value already configured in Kentik).
+   alone rather than zeroing out a real value already configured in Kentik). The
+   site's `addressClassification.userAccessNetworks` is kept in sync the same way,
+   from NetBox prefixes; see [Site userAccessNetworks](#site-useraccessnetworks).
 2. **Devices**: create or update every NetBox device in Kentik, resolving each
-   device's site, primary IP, and (optionally) NMS agent configuration.
+   device's site, primary IP, and (optionally) NMS agent configuration. Before
+   updating an existing device, its current Kentik state is fetched and compared
+   field by field so the log line for that update names exactly what's changing;
+   see [Device update visibility](#device-update-visibility).
 3. **Labels**: create Kentik labels from NetBox device roles, tenants, and tags,
    then assign the relevant labels to each device.
 
@@ -25,6 +30,34 @@ for Kentik NMS monitoring and `<agentId>` is used as the agent ID. This requires
 device to also have a primary IP set. If the tag is present but there's no IP, the
 script logs a warning and skips NMS configuration for that device (it still syncs the
 device itself).
+
+### Device update visibility
+
+When a NetBox device already exists in Kentik, the script fetches its current state
+before updating it and compares each field it manages (`deviceDescription`,
+`deviceSubtype`, `deviceSampleRate`, `deviceBgpType`, `minimizeSnmp`, `sendingIps`,
+`deviceSnmpIp`, `deviceSnmpCommunity`, site, and plan) against what this run would
+send. The log line for that update spells out exactly which fields differ:
+
+```text
+Updating device rtr1 (id=410680): deviceDescription 'old desc' -> 'new desc'; siteId 12 -> 36515
+```
+
+If nothing actually differs, the line says `(no field changes detected)` instead
+(the update call still happens either way; this only changes what's logged). NMS
+agent configuration can't be compared this way, since Kentik doesn't echo it back
+in the same shape it's written in, so it's only flagged as `NMS agent config
+included (not diffed)` rather than diffed field by field.
+
+### Site userAccessNetworks
+
+A site's Kentik `addressClassification.userAccessNetworks` is populated from NetBox:
+every NetBox prefix with status `container` that is scoped directly to that site
+(not to a region, site group, or location) contributes its CIDR to the list. This is
+computed and kept in sync on every run, the same way lat/lon is: a brand-new site is
+created with the current list, and an existing site whose network list has drifted
+(a container prefix was added, removed, or its site changed) is updated to match.
+`infrastructureNetworks` and `otherNetworks` are never touched by this script.
 
 ## Requirements
 
@@ -248,6 +281,30 @@ flags always win over env vars):
 ```bash
 uv run --env-file .env python scripts/netbox_sync.py --kentik-plan "Staging Plan"
 ```
+
+## Per-item failures
+
+If a single site, device, or label create/update/assignment fails (e.g. Kentik rejects
+one bad value, or that one call runs out of network retries), the script logs the full
+raw error immediately and keeps going with everything else instead of aborting the
+whole run. Every failure is listed in a summary table printed at the end, with the
+reason reduced to just the status code and the API's own error message (instead of the
+raw `HTTP POST <url> returned 400: {"code":3,"message":"...","details":[]}` wrapper),
+so it's actually readable instead of getting truncated mid-JSON:
+
+```text
+┌─────────────────┬─────────┬─────────────────────────────────────────────────────────────┐
+│ Phase            │ Item    │ Reason                                                       │
+├─────────────────┼─────────┼─────────────────────────────────────────────────────────────┤
+│ devices          │ rtr9    │ 400: ValidationError: Device name (rtr9) Already Exists      │
+│ labels: assign   │ rtr14   │ HTTP PUT https://.../labels failed after 3 retries           │
+└─────────────────┴─────────┴─────────────────────────────────────────────────────────────┘
+```
+
+The script exits with status `1` whenever at least one item failed, so it's safe to
+gate CI/cron on the exit code. Since every phase is idempotent, re-running the same
+command only retries what actually failed; everything that already succeeded is
+detected as up to date and left alone.
 
 ## Tests
 

@@ -4,9 +4,19 @@
 """Sync NetBox devices, sites, and labels to Kentik.
 
 Execution order:
-  1. Sites  – ensure every NetBox site exists in Kentik (create if missing).
+  1. Sites  – ensure every NetBox site exists in Kentik (create if missing) with
+     matching lat/lon and userAccessNetworks (see below).
   2. Devices – create or update every NetBox device in Kentik.
   3. Labels  – create role/tenant/tag labels, then assign them to devices.
+
+Site userAccessNetworks:
+  A site's Kentik addressClassification.userAccessNetworks is kept in sync with
+  the CIDRs of NetBox prefixes that have status "container" and are scoped
+  directly to that site. Existing sites whose set of networks has drifted are
+  updated alongside (or independently of) any lat/lon drift; infrastructureNetworks
+  and otherNetworks are left untouched. Prefixes scoped to a region, site group,
+  or location rather than a specific site are not associated with any one site
+  and are skipped.
 
 Configuration (env vars or CLI flags):
   KENTIK_EMAIL          Kentik API email                --kentik-email
@@ -79,12 +89,31 @@ Network errors:
   traceback. Since every phase is idempotent (create-or-update, compare-then-set),
   it is always safe to simply re-run the same command after a failure: already
   synced sites/devices/labels are detected as up to date and left alone.
+
+Per-item failures:
+  If a single site, device, or label create/update/assignment fails (e.g. a bad
+  value rejected by Kentik, or retries exhausted for that one call), the error is
+  logged immediately and the run continues with the remaining items rather than
+  aborting the whole phase. Every recorded failure is listed in a summary table
+  printed at the end of the run, with the reason reduced to Kentik/NetBox's own
+  error message (instead of the raw HTTP wrapper) so it's readable at a glance.
+  The script exits with a non-zero status if there was at least one failure.
+  Since every phase is idempotent, simply re-running the same command retries
+  only what failed (everything else is already in sync).
+
+Device update visibility:
+  Before updating an existing device, its current state is fetched from Kentik and
+  compared field by field against what this run would send; the log line for that
+  update names exactly which fields differ and their old -> new values (or says so
+  explicitly if nothing actually changed). NMS agent config can't be compared this
+  way, so it's only flagged as present rather than diffed.
 """
 
 import argparse
 import json
 import logging
 import os
+import re
 import sys
 import time
 
@@ -279,9 +308,13 @@ class KentikClient:
             raise RuntimeError("Kentik GET /site/v202211/sites returned 404: check API base URL/region")
         return {site["title"]: site for site in resp.json().get("sites", [])}
 
-    def create_site(self, title, lat=0.0, lon=0.0):
+    def create_site(self, title, lat=0.0, lon=0.0, user_access_networks=None):
+        user_access_networks = user_access_networks or []
         if self.dry_run:
-            log.info("[DRY-RUN] Would create site: %s (lat=%s, lon=%s)", title, lat, lon)
+            log.info(
+                "[DRY-RUN] Would create site: %s (lat=%s, lon=%s, userAccessNetworks=%s)",
+                title, lat, lon, user_access_networks,
+            )
             return self._next_dry_run_id()
 
         payload = {
@@ -292,7 +325,7 @@ class KentikClient:
                 "type": "SITE_TYPE_OTHER",
                 "addressClassification": {
                     "infrastructureNetworks": [],
-                    "userAccessNetworks": [],
+                    "userAccessNetworks": user_access_networks,
                     "otherNetworks": [],
                 },
             }
@@ -319,14 +352,18 @@ class KentikClient:
             raise RuntimeError(f"Kentik PUT /site/v202211/sites/{site_id} returned 404")
         return resp.json()["site"]["id"]
 
-    def ensure_site(self, title, lat=0.0, lon=0.0, site_cache=None):
+    def ensure_site(self, title, lat=0.0, lon=0.0, user_access_networks=None, site_cache=None):
         """Return the Kentik site ID, creating the site if it does not exist."""
+        user_access_networks = user_access_networks or []
         if site_cache is None:
             site_cache = {}
         if title not in site_cache:
             log.info("Creating missing site: %s", title)
-            new_id = self.create_site(title, lat, lon)
-            site_cache[title] = {"id": new_id, "title": title, "lat": lat, "lon": lon}
+            new_id = self.create_site(title, lat, lon, user_access_networks)
+            site_cache[title] = {
+                "id": new_id, "title": title, "lat": lat, "lon": lon,
+                "addressClassification": {"userAccessNetworks": user_access_networks},
+            }
         return site_cache[title]["id"]
 
     # ---- Labels ----
@@ -430,18 +467,22 @@ class KentikClient:
             raise RuntimeError(f"Kentik PUT /device/v202504beta2/device/{device_id} returned 404")
         return resp.json()["device"]["id"]
 
+    def get_device(self, device_id):
+        """Return the full Kentik device object for device_id."""
+        resp = kentik_request(
+            "GET", f"{self._base}/device/v202504beta2/device/{device_id}", self._h
+        )
+        if resp is None:
+            raise RuntimeError(f"Kentik GET /device/v202504beta2/device/{device_id} returned 404")
+        return resp.json()["device"]
+
     def get_device_label_ids(self, device_id):
         if isinstance(device_id, int) and device_id < 0:
             # Placeholder ID for a device that only exists in this dry run, so it
             # has no real labels to fetch yet.
             return []
 
-        resp = kentik_request(
-            "GET", f"{self._base}/device/v202504beta2/device/{device_id}", self._h
-        )
-        if resp is None:
-            raise RuntimeError(f"Kentik GET /device/v202504beta2/device/{device_id} returned 404")
-        return [label["id"] for label in resp.json()["device"].get("labels", [])]
+        return [label["id"] for label in self.get_device(device_id).get("labels", [])]
 
     def set_device_labels(self, device_id, label_ids):
         if self.dry_run:
@@ -480,6 +521,90 @@ def netbox_auth_header(token):
     return f"Token {token}"
 
 
+def container_prefixes_by_site(netbox_prefixes):
+    """Return {site_name: sorted [cidr, ...]} from NetBox prefixes with status
+    'container', for prefixes scoped directly to a site. Prefixes scoped to a
+    region, site group, or location (or not scoped at all) are not associated
+    with a single site and are skipped.
+    """
+    by_site = {}
+    for prefix in netbox_prefixes:
+        if prefix.get("scope_type") != "dcim.site":
+            continue
+        scope = prefix.get("scope") or {}
+        site_name = scope.get("name")
+        cidr = prefix.get("prefix")
+        if not site_name or not cidr:
+            continue
+        by_site.setdefault(site_name, set()).add(cidr)
+    return {site_name: sorted(cidrs) for site_name, cidrs in by_site.items()}
+
+
+_HTTP_ERROR_RE = re.compile(r"^HTTP \S+ \S+ returned (\d+): (.*)$", re.DOTALL)
+
+
+def _clean_failure_reason(reason):
+    """Reduce a raw HTTP failure string to just its status code and the API's
+    own error message, so it reads on one line instead of being an opaque
+    'HTTP POST <url> returned 400: {"code":3,"message":"...","details":[]}'
+    blob. Falls back to the original text for anything that doesn't match
+    (e.g. the "failed after 3 retries" network-error message).
+    """
+    match = _HTTP_ERROR_RE.match(reason)
+    if not match:
+        return reason
+    status_code, body = match.groups()
+    try:
+        parsed = json.loads(body)
+    except (ValueError, TypeError):
+        return f"{status_code}: {body}"
+    if isinstance(parsed, dict) and "message" in parsed:
+        return f"{status_code}: {parsed['message']}"
+    return f"{status_code}: {body}"
+
+
+def _record_failure(failures, phase, item, exc):
+    """Log a single item's failure and record it, instead of letting it abort
+    the whole phase. The item is simply left out of this run's result and can
+    be retried by re-running the script, since every phase is idempotent.
+
+    The full raw error is logged immediately (for anyone tailing output live),
+    while a cleaned-up, one-line version is stored for the end-of-run table.
+    """
+    reason = str(exc)
+    log.error("%s: %s failed: %s", phase, item, reason)
+    failures.append({"phase": phase, "item": item, "reason": _clean_failure_reason(reason)})
+
+
+def format_failures_table(failures):
+    """Render failures as a Unicode box-drawing table with columns Phase, Item, Reason."""
+    headers = ("Phase", "Item", "Reason")
+    max_reason_len = 160
+
+    rows = []
+    for failure in failures:
+        reason = failure["reason"]
+        if len(reason) > max_reason_len:
+            reason = reason[: max_reason_len - 1] + "…"
+        rows.append((failure["phase"], failure["item"], reason))
+
+    widths = [
+        max(len(headers[col]), max((len(row[col]) for row in rows), default=0))
+        for col in range(3)
+    ]
+
+    def border(left, mid, right):
+        return left + mid.join("─" * (width + 2) for width in widths) + right
+
+    def row_line(cells):
+        return "│ " + " │ ".join(cell.ljust(widths[col]) for col, cell in enumerate(cells)) + " │"
+
+    lines = [border("┌", "┬", "┐"), row_line(headers), border("├", "┼", "┤")]
+    lines.extend(row_line(row) for row in rows)
+    lines.append(border("└", "┴", "┘"))
+    return "\n".join(lines)
+
+
 def nms_agent_tag(nb_device):
     """Return agent ID string if the device carries a kentik_primary_agent=<id> tag."""
     prefix = NMS_AGENT_TAG + "="
@@ -496,19 +621,28 @@ def nms_agent_tag(nb_device):
 # Phase 1 – Sites
 # ---------------------------------------------------------------------------
 
-def sync_sites(kentik, netbox_sites, limit=None):
-    """Ensure every NetBox site exists in Kentik with matching lat/lon.
+def sync_sites(kentik, netbox_sites, container_prefixes_by_site=None, limit=None, failures=None):
+    """Ensure every NetBox site exists in Kentik with matching lat/lon and
+    userAccessNetworks.
 
-    Missing sites are created; existing sites whose lat/lon has drifted from
-    NetBox's current values are updated. NetBox is treated as the source of
-    truth for coordinates, but only when NetBox actually has a value: a
-    NetBox site with no latitude/longitude set is left alone rather than
-    zeroing out a real value that may already be configured in Kentik.
+    Missing sites are created; existing sites whose lat/lon or
+    userAccessNetworks (the CIDRs of NetBox's container-status prefixes
+    scoped to that site) have drifted from NetBox's current values are
+    updated. NetBox is treated as the source of truth, but only when NetBox
+    actually has a value: a NetBox site with no latitude/longitude set is
+    left alone rather than zeroing out a real value that may already be
+    configured in Kentik.
+
+    A site whose create/update call fails is recorded in failures (if given)
+    and skipped, rather than aborting the sync of every other site.
 
     Returns {name: kentik_id}.
     """
     log.info("=== Phase 1: Syncing sites (%d NetBox sites) ===", len(netbox_sites))
     site_cache = kentik.get_sites()
+    container_prefixes_by_site = container_prefixes_by_site or {}
+    if failures is None:
+        failures = []
     touched = 0
 
     for nb_site in netbox_sites:
@@ -517,26 +651,47 @@ def sync_sites(kentik, netbox_sites, limit=None):
         nb_lon = nb_site.get("longitude")
         nb_lat = float(nb_lat) if nb_lat is not None else None
         nb_lon = float(nb_lon) if nb_lon is not None else None
+        nb_networks = container_prefixes_by_site.get(name, [])
 
         if name in site_cache:
             log.info("Site already exists: %s", name)
             existing = site_cache[name]
-            if nb_lat is None or nb_lon is None:
-                continue
-            if float(existing.get("lat") or 0) == nb_lat and float(existing.get("lon") or 0) == nb_lon:
+
+            changes = {}
+            if nb_lat is not None and nb_lon is not None and (
+                float(existing.get("lat") or 0) != nb_lat or float(existing.get("lon") or 0) != nb_lon
+            ):
+                changes["lat/lon"] = f"{existing.get('lat')},{existing.get('lon')} -> {nb_lat},{nb_lon}"
+
+            existing_networks = sorted((existing.get("addressClassification") or {}).get("userAccessNetworks", []) or [])
+            if existing_networks != nb_networks:
+                changes["userAccessNetworks"] = f"{existing_networks} -> {nb_networks}"
+
+            if not changes:
                 continue
 
             if limit is not None and touched >= limit:
-                log.info("Site limit (%d) reached; skipping lat/lon update for: %s", limit, name)
+                log.info("Site limit (%d) reached; skipping update for: %s", limit, name)
                 continue
 
             log.info(
-                "Site %s: lat/lon drifted (Kentik %s,%s -> NetBox %s,%s); updating",
-                name, existing.get("lat"), existing.get("lon"), nb_lat, nb_lon,
+                "Site %s: %s; updating",
+                name, "; ".join(f"{field} drifted ({diff})" for field, diff in changes.items()),
             )
-            updated_site = dict(existing, lat=nb_lat, lon=nb_lon)
-            kentik.update_site(existing["id"], updated_site)
-            existing["lat"], existing["lon"] = nb_lat, nb_lon
+            updated_site = dict(existing)
+            if "lat/lon" in changes:
+                updated_site["lat"], updated_site["lon"] = nb_lat, nb_lon
+            if "userAccessNetworks" in changes:
+                address_classification = dict(existing.get("addressClassification") or {})
+                address_classification["userAccessNetworks"] = nb_networks
+                updated_site["addressClassification"] = address_classification
+
+            try:
+                kentik.update_site(existing["id"], updated_site)
+            except RuntimeError as exc:
+                _record_failure(failures, "sites", name, exc)
+                continue
+            existing.update(updated_site)
             touched += 1
             continue
 
@@ -544,7 +699,14 @@ def sync_sites(kentik, netbox_sites, limit=None):
             log.info("Site limit (%d) reached; skipping site: %s", limit, name)
             continue
 
-        kentik.ensure_site(title=name, lat=nb_lat or 0.0, lon=nb_lon or 0.0, site_cache=site_cache)
+        try:
+            kentik.ensure_site(
+                title=name, lat=nb_lat or 0.0, lon=nb_lon or 0.0,
+                user_access_networks=nb_networks, site_cache=site_cache,
+            )
+        except RuntimeError as exc:
+            _record_failure(failures, "sites", name, exc)
+            continue
         touched += 1
 
     log.info("Phase 1 complete. %d sites in Kentik.", len(site_cache))
@@ -555,11 +717,58 @@ def sync_sites(kentik, netbox_sites, limit=None):
 # Phase 2 – Devices
 # ---------------------------------------------------------------------------
 
-def sync_devices(kentik, netbox_devices, site_cache, plan_id, cfg, limit=None):
-    """Create or update every NetBox device in Kentik. Returns {name: kentik_device_id}."""
+# Fields this script writes that come back under the same key name when a
+# device is read back via KentikClient.get_device.
+_DEVICE_DIFF_FIELDS = (
+    "deviceDescription", "deviceSubtype", "deviceSampleRate", "deviceBgpType",
+    "minimizeSnmp", "sendingIps", "deviceSnmpIp", "deviceSnmpCommunity",
+)
+
+
+def _device_field_changes(existing_device, desired_device):
+    """Compare a device object read from Kentik against the payload this
+    script is about to send, and return {field: "old -> new"} for every
+    field that actually differs. siteId/planId are compared against the
+    read side's nested site.id/plan.id, since Kentik returns those as
+    objects on read but expects flat IDs on write. NMS config isn't
+    comparable this way (it isn't echoed back in a matching shape), so it's
+    only flagged as present rather than diffed.
+    """
+    changes = {}
+    for field in _DEVICE_DIFF_FIELDS:
+        if field not in desired_device:
+            continue
+        old, new = existing_device.get(field), desired_device[field]
+        if str(old) != str(new):
+            changes[field] = f"{old!r} -> {new!r}"
+
+    old_site_id = str((existing_device.get("site") or {}).get("id"))
+    new_site_id = str(desired_device.get("siteId"))
+    if old_site_id != new_site_id:
+        changes["siteId"] = f"{old_site_id} -> {new_site_id}"
+
+    old_plan_id = str((existing_device.get("plan") or {}).get("id"))
+    new_plan_id = str(desired_device.get("planId"))
+    if old_plan_id != new_plan_id:
+        changes["planId"] = f"{old_plan_id} -> {new_plan_id}"
+
+    if "nms" in desired_device:
+        changes["nms"] = "NMS agent config included (not diffed)"
+
+    return changes
+
+
+def sync_devices(kentik, netbox_devices, site_cache, plan_id, cfg, limit=None, failures=None):
+    """Create or update every NetBox device in Kentik. Returns {name: kentik_device_id}.
+
+    A device whose create/update call fails is recorded in failures (if
+    given) and skipped, rather than aborting the sync of every other device.
+    """
     log.info("=== Phase 2: Syncing devices (%d NetBox devices) ===", len(netbox_devices))
     device_ids = {}
     processed = 0
+    if failures is None:
+        failures = []
 
     for nb_device in netbox_devices:
         if limit is not None and processed >= limit:
@@ -615,14 +824,27 @@ def sync_devices(kentik, netbox_devices, site_cache, plan_id, cfg, limit=None):
         elif agent_id and not ip_address:
             log.warning("Device %s: NMS agent tag found (id=%s) but no primary IP, skipping NMS", name, agent_id)
 
-        existing_id = kentik.check_device(name)
-        if existing_id:
-            log.info("Updating device: %s (id=%s)", name, existing_id)
-            kentik.update_device(existing_id, device_obj, site_title=site_name)
-            device_ids[name] = existing_id
-        else:
-            log.info("Creating device: %s", name)
-            device_ids[name] = kentik.create_device(device_obj, site_title=site_name)
+        try:
+            existing_id = kentik.check_device(name)
+            if existing_id:
+                existing_device = kentik.get_device(existing_id)
+                changes = _device_field_changes(existing_device, device_obj)
+                if changes:
+                    log.info(
+                        "Updating device %s (id=%s): %s",
+                        name, existing_id,
+                        "; ".join(f"{field} {diff}" for field, diff in changes.items()),
+                    )
+                else:
+                    log.info("Updating device: %s (id=%s) (no field changes detected)", name, existing_id)
+                kentik.update_device(existing_id, device_obj, site_title=site_name)
+                device_ids[name] = existing_id
+            else:
+                log.info("Creating device: %s", name)
+                device_ids[name] = kentik.create_device(device_obj, site_title=site_name)
+        except RuntimeError as exc:
+            _record_failure(failures, "devices", name, exc)
+            continue
 
         processed += 1
 
@@ -634,19 +856,27 @@ def sync_devices(kentik, netbox_devices, site_cache, plan_id, cfg, limit=None):
 # Phase 3 – Labels
 # ---------------------------------------------------------------------------
 
-def lookup_device_ids(kentik, netbox_devices):
+def lookup_device_ids(kentik, netbox_devices, failures=None):
     """Resolve {name: kentik_device_id} via an individual read per NetBox device.
 
     Used to run Phase 3 with --only labels, where Phase 2 did not just run so
-    there's no in-memory device_ids result to reuse.
+    there's no in-memory device_ids result to reuse. A device whose lookup
+    fails (as opposed to simply not existing yet) is recorded in failures
+    (if given) and skipped.
     """
+    if failures is None:
+        failures = []
     device_ids = {}
     for nb_device in netbox_devices:
         device_name = nb_device.get("name")
         if not device_name:
             continue
         name = device_name.lower()
-        existing_id = kentik.check_device(name)
+        try:
+            existing_id = kentik.check_device(name)
+        except RuntimeError as exc:
+            _record_failure(failures, "labels: assign", name, exc)
+            continue
         if existing_id:
             device_ids[name] = existing_id
         else:
@@ -655,7 +885,7 @@ def lookup_device_ids(kentik, netbox_devices):
 
 
 def sync_labels(kentik, netbox_devices, netbox_roles, netbox_tenants, netbox_tags, device_ids,
-                 limit=None, skip_assignment=False):
+                 limit=None, skip_assignment=False, failures=None):
     """Create labels from NetBox metadata and, unless skip_assignment, assign them to devices.
 
     device_ids may be None, meaning Phase 2 did not just run (e.g. --only
@@ -663,10 +893,15 @@ def sync_labels(kentik, netbox_devices, netbox_roles, netbox_tenants, netbox_tag
     right before assignment, after labels have already been created. That
     resolution (one Kentik read per NetBox device) is skipped entirely when
     skip_assignment is set, since it would only be needed for assignment.
+
+    A label create or device label assignment that fails is recorded in
+    failures (if given) and skipped, rather than aborting the whole phase.
     """
     log.info("=== Phase 3: Syncing labels ===")
     label_cache = kentik.get_labels()
     created = 0
+    if failures is None:
+        failures = []
 
     def ensure_within_budget(name, color):
         nonlocal created
@@ -675,7 +910,11 @@ def sync_labels(kentik, netbox_devices, netbox_roles, netbox_tenants, netbox_tag
             log.info("Label limit (%d) reached; skipping label: %s", limit, name)
             return
         was_new = key not in label_cache
-        kentik.ensure_label(name, color, label_cache)
+        try:
+            kentik.ensure_label(name, color, label_cache)
+        except RuntimeError as exc:
+            _record_failure(failures, "labels: create", name, exc)
+            return
         if was_new:
             created += 1
 
@@ -704,7 +943,7 @@ def sync_labels(kentik, netbox_devices, netbox_roles, netbox_tenants, netbox_tag
 
     if device_ids is None:
         log.info("Resolving device IDs for label assignment...")
-        device_ids = lookup_device_ids(kentik, netbox_devices)
+        device_ids = lookup_device_ids(kentik, netbox_devices, failures=failures)
 
     log.info("Assigning labels to devices...")
     assigned = 0
@@ -743,12 +982,16 @@ def sync_labels(kentik, netbox_devices, netbox_roles, netbox_tenants, netbox_tag
         if not desired:
             continue
 
+        try:
+            existing = kentik.get_device_label_ids(device_id)
+            merged = list(set(existing + desired))
+            if sorted(merged) != sorted(existing):
+                log.info("Setting labels for %s: %s", name, merged)
+                kentik.set_device_labels(device_id, merged)
+        except RuntimeError as exc:
+            _record_failure(failures, "labels: assign", name, exc)
+            continue
         assigned += 1
-        existing = kentik.get_device_label_ids(device_id)
-        merged = list(set(existing + desired))
-        if sorted(merged) != sorted(existing):
-            log.info("Setting labels for %s: %s", name, merged)
-            kentik.set_device_labels(device_id, merged)
 
     log.info("Phase 3 complete.")
 
@@ -785,11 +1028,15 @@ def main():
     netbox_roles = netbox_get_all(f"{nb_base}/api/dcim/device-roles/?limit=0", nb_headers, verify=nb_verify)
     netbox_tenants = netbox_get_all(f"{nb_base}/api/tenancy/tenants/?limit=0", nb_headers, verify=nb_verify)
     netbox_tags = netbox_get_all(f"{nb_base}/api/extras/tags/?limit=0", nb_headers, verify=nb_verify)
-    log.info(
-        "NetBox data: %d sites, %d devices, %d roles, %d tenants, %d tags",
-        len(netbox_sites), len(netbox_devices), len(netbox_roles),
-        len(netbox_tenants), len(netbox_tags),
+    netbox_container_prefixes = netbox_get_all(
+        f"{nb_base}/api/ipam/prefixes/?status=container&limit=0", nb_headers, verify=nb_verify
     )
+    log.info(
+        "NetBox data: %d sites, %d devices, %d roles, %d tenants, %d tags, %d container prefixes",
+        len(netbox_sites), len(netbox_devices), len(netbox_roles),
+        len(netbox_tenants), len(netbox_tags), len(netbox_container_prefixes),
+    )
+    site_networks = container_prefixes_by_site(netbox_container_prefixes)
 
     kentik = KentikClient(cfg.kentik_email, cfg.kentik_token, cfg.kentik_region, dry_run=cfg.dry_run)
 
@@ -805,8 +1052,14 @@ def main():
         plan_id = kentik.get_plan_id(cfg.kentik_plan)
         log.info("Kentik plan: '%s' (id=%s)", cfg.kentik_plan, plan_id)
 
+    # Shared across phases: a per-item failure (e.g. one bad device) is logged
+    # and recorded here instead of aborting the rest of the run, so a single
+    # bad record doesn't block everything else from syncing.
+    failures = []
+
     if run_sites:
-        site_cache = sync_sites(kentik, netbox_sites, limit=cfg.limit)
+        site_cache = sync_sites(kentik, netbox_sites, container_prefixes_by_site=site_networks,
+                                 limit=cfg.limit, failures=failures)
     elif run_devices:
         # Devices still need to resolve existing sites, just without Phase 1's
         # create/update logic running.
@@ -815,7 +1068,8 @@ def main():
         site_cache = {}
 
     if run_devices:
-        device_ids = sync_devices(kentik, netbox_devices, site_cache, plan_id, cfg, limit=cfg.limit)
+        device_ids = sync_devices(kentik, netbox_devices, site_cache, plan_id, cfg,
+                                   limit=cfg.limit, failures=failures)
     else:
         # None (rather than {}) signals sync_labels to resolve device IDs
         # itself, after labels are created, if it ends up needing them.
@@ -823,7 +1077,14 @@ def main():
 
     if run_labels:
         sync_labels(kentik, netbox_devices, netbox_roles, netbox_tenants, netbox_tags, device_ids,
-                    limit=cfg.limit, skip_assignment=cfg.skip_label_assignment)
+                    limit=cfg.limit, skip_assignment=cfg.skip_label_assignment, failures=failures)
+
+    if failures:
+        log.error("Sync completed with %d failure(s):", len(failures))
+        print()
+        print(format_failures_table(failures))
+        print()
+        sys.exit(1)
 
     log.info("Sync complete.")
 
