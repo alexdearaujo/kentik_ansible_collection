@@ -1126,10 +1126,13 @@ KENTIK_V5_PATH = urlparse(KENTIK_V5).path  # "/api/v5", derived, not retyped, so
                                             # future path change only needs updating above.
 
 # Path suffixes (relative to KENTIK_BASE), shared between mock registration and
-# request-history assertions so the two can't silently drift apart.
-SITES_PATH = "/site/v202211/sites"
-LABELS_PATH = "/label/v202210/labels"
-DEVICE_PATH = "/device/v202504beta2/device"
+# request-history assertions so the two can't silently drift apart. Sourced
+# directly from netbox_sync's own constants (the single place these versions
+# are defined) rather than retyped, so a version bump there doesn't silently
+# leave the tests pinned to a stale endpoint.
+SITES_PATH = ns.KENTIK_SITES_PATH
+LABELS_PATH = ns.KENTIK_LABELS_PATH
+DEVICE_PATH = ns.KENTIK_DEVICE_PATH
 
 
 def device_id_path(device_id):

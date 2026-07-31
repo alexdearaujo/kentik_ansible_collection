@@ -307,6 +307,14 @@ def netbox_get_all(url, headers, verify=True):
 # Kentik API client
 # ---------------------------------------------------------------------------
 
+# Versioned Kentik model API paths (relative to self._base). Bump the version
+# here when Kentik ships a new one; every request/error message below refers
+# to these constants rather than repeating the literal path.
+KENTIK_SITES_PATH = "/site/v202509/sites"
+KENTIK_LABELS_PATH = "/label/v202210/labels"
+KENTIK_DEVICE_PATH = "/device/v202504beta2/device"
+
+
 class KentikClient:
     def __init__(self, email, token, region="US", dry_run=False):
         if region == "EU":
@@ -343,9 +351,9 @@ class KentikClient:
         detect drift and PUT back a complete object without clobbering
         fields they don't otherwise touch.
         """
-        resp = kentik_request("GET", f"{self._base}/site/v202211/sites", self._h)
+        resp = kentik_request("GET", f"{self._base}{KENTIK_SITES_PATH}", self._h)
         if resp is None:
-            raise RuntimeError("Kentik GET /site/v202211/sites returned 404: check API base URL/region")
+            raise RuntimeError(f"Kentik GET {KENTIK_SITES_PATH} returned 404: check API base URL/region")
         return {site["title"]: site for site in resp.json().get("sites", [])}
 
     def create_site(self, title, lat=0.0, lon=0.0, user_access_networks=None):
@@ -370,9 +378,9 @@ class KentikClient:
                 },
             }
         }
-        resp = kentik_request("POST", f"{self._base}/site/v202211/sites", self._h, payload)
+        resp = kentik_request("POST", f"{self._base}{KENTIK_SITES_PATH}", self._h, payload)
         if resp is None:
-            raise RuntimeError(f"Kentik POST /site/v202211/sites returned 404 for site '{title}'")
+            raise RuntimeError(f"Kentik POST {KENTIK_SITES_PATH} returned 404 for site '{title}'")
         return resp.json()["site"]["id"]
 
     def update_site(self, site_id, site_obj):
@@ -387,9 +395,9 @@ class KentikClient:
                       json.dumps(site_obj, indent=2, sort_keys=True))
             return site_id
 
-        resp = kentik_request("PUT", f"{self._base}/site/v202211/sites/{site_id}", self._h, {"site": site_obj})
+        resp = kentik_request("PUT", f"{self._base}{KENTIK_SITES_PATH}/{site_id}", self._h, {"site": site_obj})
         if resp is None:
-            raise RuntimeError(f"Kentik PUT /site/v202211/sites/{site_id} returned 404")
+            raise RuntimeError(f"Kentik PUT {KENTIK_SITES_PATH}/{site_id} returned 404")
         return resp.json()["site"]["id"]
 
     def ensure_site(self, title, lat=0.0, lon=0.0, user_access_networks=None, site_cache=None):
@@ -410,9 +418,9 @@ class KentikClient:
 
     def get_labels(self):
         """Return {name.lower(): id} for all Kentik labels."""
-        resp = kentik_request("GET", f"{self._base}/label/v202210/labels", self._h)
+        resp = kentik_request("GET", f"{self._base}{KENTIK_LABELS_PATH}", self._h)
         if resp is None:
-            raise RuntimeError("Kentik GET /label/v202210/labels returned 404: check API base URL/region")
+            raise RuntimeError(f"Kentik GET {KENTIK_LABELS_PATH} returned 404: check API base URL/region")
         return {label["name"].lower(): label["id"] for label in resp.json().get("labels", [])}
 
     def create_label(self, name, color):
@@ -421,9 +429,9 @@ class KentikClient:
             return self._next_dry_run_id()
 
         payload = {"label": {"name": name, "color": color}}
-        resp = kentik_request("POST", f"{self._base}/label/v202210/labels", self._h, payload)
+        resp = kentik_request("POST", f"{self._base}{KENTIK_LABELS_PATH}", self._h, payload)
         if resp is None:
-            raise RuntimeError(f"Kentik POST /label/v202210/labels returned 404 for label '{name}'")
+            raise RuntimeError(f"Kentik POST {KENTIK_LABELS_PATH} returned 404 for label '{name}'")
         return resp.json()["label"]["id"]
 
     def ensure_label(self, name, color, label_cache):
@@ -481,11 +489,11 @@ class KentikClient:
             return self._next_dry_run_id()
 
         resp = kentik_request(
-            "POST", f"{self._base}/device/v202504beta2/device", self._h,
+            "POST", f"{self._base}{KENTIK_DEVICE_PATH}", self._h,
             {"device": device_obj}
         )
         if resp is None:
-            raise RuntimeError(f"Kentik POST /device/v202504beta2/device returned 404 for device '{device_obj.get('deviceName')}'")
+            raise RuntimeError(f"Kentik POST {KENTIK_DEVICE_PATH} returned 404 for device '{device_obj.get('deviceName')}'")
         return resp.json()["device"]["id"]
 
     def update_device(self, device_id, device_obj, site_title=None):
@@ -500,20 +508,20 @@ class KentikClient:
             return device_id
 
         resp = kentik_request(
-            "PUT", f"{self._base}/device/v202504beta2/device/{device_id}", self._h,
+            "PUT", f"{self._base}{KENTIK_DEVICE_PATH}/{device_id}", self._h,
             {"device": device_obj}
         )
         if resp is None:
-            raise RuntimeError(f"Kentik PUT /device/v202504beta2/device/{device_id} returned 404")
+            raise RuntimeError(f"Kentik PUT {KENTIK_DEVICE_PATH}/{device_id} returned 404")
         return resp.json()["device"]["id"]
 
     def get_device(self, device_id):
         """Return the full Kentik device object for device_id."""
         resp = kentik_request(
-            "GET", f"{self._base}/device/v202504beta2/device/{device_id}", self._h
+            "GET", f"{self._base}{KENTIK_DEVICE_PATH}/{device_id}", self._h
         )
         if resp is None:
-            raise RuntimeError(f"Kentik GET /device/v202504beta2/device/{device_id} returned 404")
+            raise RuntimeError(f"Kentik GET {KENTIK_DEVICE_PATH}/{device_id} returned 404")
         return resp.json()["device"]
 
     def get_device_label_ids(self, device_id):
@@ -534,7 +542,7 @@ class KentikClient:
             "labels": [{"id": int(label_id)} for label_id in label_ids],
         }
         kentik_request(
-            "PUT", f"{self._base}/device/v202504beta2/device/{device_id}/labels",
+            "PUT", f"{self._base}{KENTIK_DEVICE_PATH}/{device_id}/labels",
             self._h, payload
         )
 
