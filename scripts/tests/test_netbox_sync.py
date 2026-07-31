@@ -88,6 +88,65 @@ class TestContainerPrefixesBySite:
         assert ns.container_prefixes_by_site(prefixes) == {}
 
 
+class TestResolveSiteName:
+    def _site(self, **overrides):
+        base = {
+            "name": "Riverside", "slug": "riverside", "facility": "",
+            "region": {"name": "West", "slug": "west"}, "group": None, "tenant": None,
+        }
+        base.update(overrides)
+        return base
+
+    def test_default_template_is_plain_name(self):
+        assert ns.resolve_site_name(self._site(), "{name}") == "Riverside"
+
+    def test_renders_region_and_name(self):
+        assert ns.resolve_site_name(self._site(), "{region}-{name}") == "West-Riverside"
+
+    def test_falls_back_to_name_when_referenced_region_is_null(self):
+        site = self._site(region=None)
+        assert ns.resolve_site_name(site, "{region}-{name}") == "Riverside"
+
+    def test_falls_back_to_name_when_referenced_facility_is_empty_string(self):
+        site = self._site(facility="")
+        assert ns.resolve_site_name(site, "{facility}-{name}") == "Riverside"
+
+    def test_does_not_fall_back_for_fields_the_template_does_not_use(self):
+        # region is null, but the template never references it, so it should
+        # not trigger a fallback.
+        site = self._site(region=None)
+        assert ns.resolve_site_name(site, "{name}") == "Riverside"
+
+    def test_renders_group_and_tenant(self):
+        site = self._site(group={"name": "Branch Offices"}, tenant={"name": "Acme"})
+        assert ns.resolve_site_name(site, "{tenant}/{group}/{name}") == "Acme/Branch Offices/Riverside"
+
+    def test_renders_slug(self):
+        assert ns.resolve_site_name(self._site(), "{slug}") == "riverside"
+
+    def test_renders_region_slug_instead_of_name(self):
+        # Same input either way; only the template picks name vs. slug, so
+        # switching between them is a config edit, not a code change.
+        assert ns.resolve_site_name(self._site(), "{region_slug}-{name}") == "west-Riverside"
+
+    def test_renders_group_and_tenant_slugs(self):
+        site = self._site(group={"name": "Branch Offices", "slug": "branch-offices"},
+                           tenant={"name": "Acme", "slug": "acme"})
+        assert ns.resolve_site_name(site, "{tenant_slug}/{group_slug}/{name}") == "acme/branch-offices/Riverside"
+
+    def test_falls_back_to_name_when_referenced_slug_variant_is_null(self):
+        # region is set, but has no slug (e.g. an older NetBox record) -- the
+        # slug-specific placeholder should still trigger the same fallback.
+        site = self._site(region={"name": "West", "slug": None})
+        assert ns.resolve_site_name(site, "{region_slug}-{name}") == "Riverside"
+
+    def test_does_not_fall_back_when_only_the_unused_variant_is_missing(self):
+        # region has a name but no slug; a template using {region} (not
+        # {region_slug}) should render fine since it never looks at slug.
+        site = self._site(region={"name": "West", "slug": None})
+        assert ns.resolve_site_name(site, "{region}-{name}") == "West-Riverside"
+
+
 class TestFormatFailuresTable:
     def test_renders_box_drawing_table_with_header_and_rows(self):
         failures = [
@@ -231,6 +290,31 @@ class TestGetConfigPlanRequirement:
         monkeypatch.setattr(sys, "argv", CONFIG_ARGV + ["--only", "labels"])
         cfg = ns.get_config()
         assert cfg.kentik_plan is None
+
+
+class TestGetConfigSiteNameTemplate:
+    def test_defaults_to_plain_name(self, monkeypatch):
+        monkeypatch.setattr(sys, "argv", CONFIG_ARGV + ["--only", "sites"])
+        cfg = ns.get_config()
+        assert cfg.site_name_template == "{name}"
+
+    def test_accepts_a_template_using_supported_fields(self, monkeypatch):
+        monkeypatch.setattr(sys, "argv", CONFIG_ARGV + ["--only", "sites",
+                                                          "--site-name-template", "{region}-{name}"])
+        cfg = ns.get_config()
+        assert cfg.site_name_template == "{region}-{name}"
+
+    def test_rejects_a_template_with_an_unknown_field(self, monkeypatch):
+        monkeypatch.setattr(sys, "argv", CONFIG_ARGV + ["--only", "sites",
+                                                          "--site-name-template", "{regio}-{name}"])
+        with pytest.raises(SystemExit, match="unknown field.*regio"):
+            ns.get_config()
+
+    def test_accepts_a_slug_variant_template(self, monkeypatch):
+        monkeypatch.setattr(sys, "argv", CONFIG_ARGV + ["--only", "sites",
+                                                          "--site-name-template", "{region_slug}-{name}"])
+        cfg = ns.get_config()
+        assert cfg.site_name_template == "{region_slug}-{name}"
 
 
 # ---------------------------------------------------------------------------
@@ -636,6 +720,43 @@ class TestSyncSitesUserAccessNetworks:
         _, called_obj = kentik.update_site.call_args[0]
         assert called_obj["addressClassification"]["infrastructureNetworks"] == ["10.0.0.0/8"]
         assert called_obj["addressClassification"]["otherNetworks"] == ["172.16.0.0/12"]
+
+
+class TestSyncSitesNaming:
+    def test_creates_site_using_rendered_title_but_returns_netbox_name_keyed_map(self):
+        kentik = MagicMock()
+        kentik.get_sites.return_value = {}
+        kentik.ensure_site.return_value = "501"
+        netbox_sites = [{"name": "Riverside", "region": {"name": "West"}}]
+        result = ns.sync_sites(kentik, netbox_sites, limit=None, site_name_template="{region}-{name}")
+        kentik.ensure_site.assert_called_once()
+        assert kentik.ensure_site.call_args.kwargs["title"] == "West-Riverside"
+        assert result == {"Riverside": "501"}
+
+    def test_matches_existing_site_by_rendered_title(self):
+        kentik = MagicMock()
+        kentik.get_sites.return_value = {"West-Riverside": {"id": "1", "lat": 0.0, "lon": 0.0}}
+        netbox_sites = [{"name": "Riverside", "region": {"name": "West"}}]
+        result = ns.sync_sites(kentik, netbox_sites, limit=None, site_name_template="{region}-{name}")
+        kentik.ensure_site.assert_not_called()  # already exists under the rendered title
+        assert result == {"Riverside": "1"}
+
+    def test_falls_back_to_plain_name_when_region_missing(self):
+        kentik = MagicMock()
+        kentik.get_sites.return_value = {}
+        kentik.ensure_site.return_value = "501"
+        netbox_sites = [{"name": "NoRegionSite", "region": None}]
+        ns.sync_sites(kentik, netbox_sites, limit=None, site_name_template="{region}-{name}")
+        assert kentik.ensure_site.call_args.kwargs["title"] == "NoRegionSite"
+
+    def test_default_template_behaves_like_before(self):
+        kentik = MagicMock()
+        kentik.get_sites.return_value = {}
+        kentik.ensure_site.return_value = "501"
+        netbox_sites = [{"name": "DC1"}]
+        result = ns.sync_sites(kentik, netbox_sites, limit=None)
+        assert kentik.ensure_site.call_args.kwargs["title"] == "DC1"
+        assert result == {"DC1": "501"}
 
 
 class TestSyncSitesFailures:
@@ -1113,6 +1234,30 @@ class TestEndToEnd:
         assert ("POST", LABELS_PATH) in methods
         assert ("PUT", device_labels_path("701")) in methods
 
+    def test_full_run_with_site_name_template_creates_site_and_resolves_device(self, requests_mock, monkeypatch):
+        # Phase 1 creates the site under a rendered title ("West-DC1"); Phase 2
+        # (running in the same invocation, right after) must still resolve
+        # the device's plain NetBox site name ("DC1") against it.
+        _register_netbox(
+            requests_mock,
+            devices=[_make_device("rtr1", site="DC1")],
+            sites=[{"name": "DC1", "region": {"name": "West"}}],
+        )
+        _register_kentik_reads(requests_mock)
+        requests_mock.post(f"{KENTIK_BASE}{SITES_PATH}", json={"site": {"id": "501"}})
+        requests_mock.post(f"{KENTIK_BASE}{DEVICE_PATH}", json={"device": {"id": "701"}})
+        requests_mock.get(f"{KENTIK_BASE}{device_id_path('701')}", json={"device": {"labels": []}})
+        requests_mock.put(f"{KENTIK_BASE}{device_labels_path('701')}", json={})
+
+        monkeypatch.setattr(sys, "argv", BASE_ARGV + ["--site-name-template", "{region}-{name}"])
+        ns.main()
+
+        site_create = next(r for r in requests_mock.request_history if r.method == "POST" and r.path == SITES_PATH)
+        assert site_create.json()["site"]["title"] == "West-DC1"
+
+        device_create = next(r for r in requests_mock.request_history if r.method == "POST" and r.path == DEVICE_PATH)
+        assert device_create.json()["device"]["siteId"] == 501
+
     def test_limit_caps_device_creation(self, requests_mock, monkeypatch):
         device_names = [f"rtr{i}" for i in range(3)]
         _register_netbox(
@@ -1237,3 +1382,27 @@ class TestEndToEnd:
         assert "devices" in out
         assert "bad-rtr" in out
         assert "┌" in out and "└" in out
+
+    def test_only_devices_resolves_site_through_the_name_template(self, requests_mock, monkeypatch):
+        # NetBox device records only ever carry their site's plain name
+        # ("DC1"), never its region. With a template active, the Kentik site
+        # was created under a rendered title ("West-DC1"); --only devices
+        # (which skips Phase 1) must still bridge "DC1" -> "West-DC1" -> id
+        # to resolve the device's site correctly.
+        _register_netbox(
+            requests_mock,
+            devices=[_make_device("rtr1", site="DC1")],
+            sites=[{"name": "DC1", "region": {"name": "West"}}],
+        )
+        _register_kentik_reads(requests_mock)
+        requests_mock.get(f"{KENTIK_BASE}{SITES_PATH}", json={"sites": [{"title": "West-DC1", "id": "55"}]})
+        requests_mock.post(f"{KENTIK_BASE}{DEVICE_PATH}", json={"device": {"id": "702"}})
+        requests_mock.get(f"{KENTIK_BASE}{device_id_path('702')}", json={"device": {"labels": []}})
+        requests_mock.put(f"{KENTIK_BASE}{device_labels_path('702')}", json={})
+
+        monkeypatch.setattr(sys, "argv", BASE_ARGV + ["--only", "devices", "--site-name-template", "{region}-{name}"])
+        ns.main()
+
+        create_calls = [r for r in requests_mock.request_history if r.method == "POST" and r.path == DEVICE_PATH]
+        assert len(create_calls) == 1
+        assert create_calls[0].json()["device"]["siteId"] == 55

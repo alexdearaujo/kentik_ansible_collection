@@ -14,7 +14,8 @@ The script runs in three phases, in order:
    only when NetBox actually has a value; a NetBox site with no lat/lon set is left
    alone rather than zeroing out a real value already configured in Kentik). The
    site's `addressClassification.userAccessNetworks` is kept in sync the same way,
-   from NetBox prefixes; see [Site userAccessNetworks](#site-useraccessnetworks).
+   from NetBox prefixes; see [Site userAccessNetworks](#site-useraccessnetworks). The
+   Kentik site title itself is configurable; see [Site naming](#site-naming).
 2. **Devices**: create or update every NetBox device in Kentik, resolving each
    device's site, primary IP, and (optionally) NMS agent configuration. Before
    updating an existing device, its current Kentik state is fetched and compared
@@ -48,6 +49,43 @@ If nothing actually differs, the line says `(no field changes detected)` instead
 agent configuration can't be compared this way, since Kentik doesn't echo it back
 in the same shape it's written in, so it's only flagged as `NMS agent config
 included (not diffed)` rather than diffed field by field.
+
+### Site naming
+
+By default the Kentik site title is just the NetBox site's plain `name`, unchanged.
+`--site-name-template` (or `KENTIK_SITE_NAME_TEMPLATE`) overrides this with a
+`str.format` template over a fixed set of NetBox site fields:
+
+- `{name}`, `{slug}`; the site's own fields
+- `{facility}`; the site's facility string
+- `{region}`, `{group}`, `{tenant}`; the *name* of the site's region/group/tenant
+  (e.g. "North Carolina")
+- `{region_slug}`, `{group_slug}`, `{tenant_slug}`; the *slug* of the same
+  (e.g. "us-nc")
+
+(`region`/`group`/`tenant` are NetBox foreign keys; a site with none set has both
+the name and slug variant empty for that field.)
+
+```bash
+uv run --env-file .env python scripts/netbox_sync.py --site-name-template "{region}-{name}"
+# or, using the slug instead of the full region name:
+uv run --env-file .env python scripts/netbox_sync.py --site-name-template "{region_slug}-{name}"
+```
+
+A NetBox site named "Riverside" in region "North Carolina" (slug `us-nc`) becomes
+Kentik site "North Carolina-Riverside" with the first template, or "us-nc-Riverside"
+with the second. Both variants are always available, so switching between them (or to
+`{group}`/`{tenant}` instead of `{region}` entirely) is a config change, not a code
+change.
+
+If a site is missing a field the template references (e.g. no region set), that one
+site falls back to its plain NetBox name instead of producing a broken title like
+"-Riverside"; sites with the field set still get the full template. A template
+referencing a field outside the supported set above is rejected at startup with a
+clear error, so a typo doesn't silently produce blank/wrong names across a whole run.
+
+This is a config change, not a code change, specifically so the naming scheme can be
+adjusted (or reverted to the plain name) without touching the script.
 
 ### Site userAccessNetworks
 
@@ -110,6 +148,7 @@ wins if both are given.
 | `KENTIK_SYNC_LIMIT` | `--limit` | No | Cap mutations per phase; see [Limit mode](#limit-mode) |
 | `KENTIK_SYNC_ONLY` | `--only` | No | Run a single phase; see [Running a single phase](#running-a-single-phase) |
 | `NETBOX_INSECURE_TLS` | `--netbox-insecure-tls` | No | Skip TLS verification on NetBox requests (lab/self-signed instances only) |
+| `KENTIK_SITE_NAME_TEMPLATE` | `--site-name-template` | No (default `{name}`) | Kentik site title template; see [Site naming](#site-naming) |
 
 Boolean env vars (`DRY_RUN`, `NETBOX_INSECURE_TLS`) accept `1`, `true`, `yes`, or `on`
 (case-insensitive); anything else is treated as false.

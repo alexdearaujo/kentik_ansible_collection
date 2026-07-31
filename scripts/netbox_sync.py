@@ -35,6 +35,9 @@ Configuration (env vars or CLI flags):
   KENTIK_SKIP_LABEL_ASSIGNMENT
                         Create labels, skip assignment  --skip-label-assignment
   NETBOX_INSECURE_TLS   Skip NetBox TLS verification    --netbox-insecure-tls
+  KENTIK_SITE_NAME_TEMPLATE
+                        Kentik site title template      --site-name-template
+                        (default: '{name}')
 
 NMS agent detection:
   If a device carries a NetBox tag named 'kentik_primary_agent=<agentId>' it is flagged
@@ -107,6 +110,20 @@ Device update visibility:
   update names exactly which fields differ and their old -> new values (or says so
   explicitly if nothing actually changed). NMS agent config can't be compared this
   way, so it's only flagged as present rather than diffed.
+
+Site naming:
+  --site-name-template controls the Kentik site title, as a str.format template over
+  a fixed set of NetBox site fields: {name}, {slug}, {facility}, {region}, {group},
+  {tenant} (the .name of each foreign key), and {region_slug}, {group_slug},
+  {tenant_slug} (the .slug of the same) -- both variants are always available, so
+  which one a template uses is a config choice, not a code change. Default is
+  "{name}" (the site's plain NetBox name, unchanged). If any field the template
+  actually references is null or empty for a given site, that site falls back to
+  its plain NetBox name rather than producing a partial title like "-Riverside".
+  A template referencing an unsupported field name is rejected at startup. NetBox
+  device records only carry their site's plain name (not region/group/tenant), so
+  this mapping is resolved once from the full site list and reused wherever a
+  device's site needs to be looked up.
 """
 
 import argparse
@@ -114,6 +131,7 @@ import json
 import logging
 import os
 import re
+import string
 import sys
 import time
 
@@ -124,6 +142,14 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger(__name__)
 
 NMS_AGENT_TAG = "kentik_primary_agent"
+
+# Fields --site-name-template may reference; see resolve_site_name().
+SITE_NAME_TEMPLATE_FIELDS = (
+    "name", "slug", "facility",
+    "region", "region_slug",
+    "group", "group_slug",
+    "tenant", "tenant_slug",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -174,6 +200,12 @@ def get_config():
                              "to any device. Skips resolving device IDs entirely, so it also "
                              "avoids the extra per-device lookup that --only labels would "
                              "otherwise do.")
+    parser.add_argument("--site-name-template",
+                        default=os.environ.get("KENTIK_SITE_NAME_TEMPLATE", "{name}"),
+                        help="str.format template for the Kentik site title, over NetBox site "
+                             f"fields {', '.join('{' + f + '}' for f in SITE_NAME_TEMPLATE_FIELDS)}. "
+                             "A site missing a field the template references falls back to its "
+                             "plain NetBox name. Default: '{name}' (unchanged).")
     cfg = parser.parse_args()
 
     missing = [name for name, attr in [
@@ -191,6 +223,14 @@ def get_config():
 
     if cfg.limit is not None and cfg.limit < 1:
         sys.exit("--limit must be a positive integer")
+
+    referenced_fields = {field for _, field, _, _ in string.Formatter().parse(cfg.site_name_template) if field}
+    unknown_fields = referenced_fields - set(SITE_NAME_TEMPLATE_FIELDS)
+    if unknown_fields:
+        sys.exit(
+            f"--site-name-template references unknown field(s): {', '.join(sorted(unknown_fields))}. "
+            f"Supported fields: {', '.join(SITE_NAME_TEMPLATE_FIELDS)}"
+        )
 
     return cfg
 
@@ -540,6 +580,35 @@ def container_prefixes_by_site(netbox_prefixes):
     return {site_name: sorted(cidrs) for site_name, cidrs in by_site.items()}
 
 
+def resolve_site_name(nb_site, template):
+    """Render a NetBox site's Kentik site title from `template`, a str.format
+    string over SITE_NAME_TEMPLATE_FIELDS. region/group/tenant are NetBox
+    foreign keys: {region}/{group}/{tenant} resolve to their .name (e.g.
+    "North Carolina"), {region_slug}/{group_slug}/{tenant_slug} to their
+    .slug (e.g. "us-nc") -- both variants are always available so which one
+    a template uses is purely a config choice. facility/slug/name are
+    already plain strings on the site itself.
+
+    If any field the template actually references is null or empty for this
+    particular site, falls back to the site's plain NetBox name rather than
+    producing a partial title (e.g. "-Riverside" when region is unset).
+    """
+    context = {
+        "name": nb_site.get("name"),
+        "slug": nb_site.get("slug"),
+        "facility": nb_site.get("facility") or None,
+    }
+    for field in ("region", "group", "tenant"):
+        related = nb_site.get(field)
+        context[field] = related.get("name") if related else None
+        context[f"{field}_slug"] = related.get("slug") if related else None
+
+    referenced = {field for _, field, _, _ in string.Formatter().parse(template) if field}
+    if any(not context.get(field) for field in referenced):
+        return nb_site.get("name")
+    return template.format(**context)
+
+
 _HTTP_ERROR_RE = re.compile(r"^HTTP \S+ \S+ returned (\d+): (.*)$", re.DOTALL)
 
 
@@ -621,11 +690,14 @@ def nms_agent_tag(nb_device):
 # Phase 1 – Sites
 # ---------------------------------------------------------------------------
 
-def sync_sites(kentik, netbox_sites, container_prefixes_by_site=None, limit=None, failures=None):
+def sync_sites(kentik, netbox_sites, container_prefixes_by_site=None, limit=None, failures=None,
+                site_name_template="{name}"):
     """Ensure every NetBox site exists in Kentik with matching lat/lon and
     userAccessNetworks.
 
-    Missing sites are created; existing sites whose lat/lon or
+    The Kentik site title is rendered from site_name_template (see
+    resolve_site_name); by default it's just the NetBox site's plain name,
+    unchanged. Missing sites are created; existing sites whose lat/lon or
     userAccessNetworks (the CIDRs of NetBox's container-status prefixes
     scoped to that site) have drifted from NetBox's current values are
     updated. NetBox is treated as the source of truth, but only when NetBox
@@ -636,26 +708,31 @@ def sync_sites(kentik, netbox_sites, container_prefixes_by_site=None, limit=None
     A site whose create/update call fails is recorded in failures (if given)
     and skipped, rather than aborting the sync of every other site.
 
-    Returns {name: kentik_id}.
+    Returns {netbox_site_name: kentik_id}, keyed by NetBox's plain site name
+    (not the rendered Kentik title) since that's what a NetBox device record
+    references when resolving its site.
     """
     log.info("=== Phase 1: Syncing sites (%d NetBox sites) ===", len(netbox_sites))
-    site_cache = kentik.get_sites()
+    site_cache = kentik.get_sites()  # keyed by Kentik title
     container_prefixes_by_site = container_prefixes_by_site or {}
     if failures is None:
         failures = []
     touched = 0
+    site_ids_by_netbox_name = {}
 
     for nb_site in netbox_sites:
-        name = nb_site["name"]
+        netbox_name = nb_site["name"]
+        title = resolve_site_name(nb_site, site_name_template)
         nb_lat = nb_site.get("latitude")
         nb_lon = nb_site.get("longitude")
         nb_lat = float(nb_lat) if nb_lat is not None else None
         nb_lon = float(nb_lon) if nb_lon is not None else None
-        nb_networks = container_prefixes_by_site.get(name, [])
+        nb_networks = container_prefixes_by_site.get(netbox_name, [])
 
-        if name in site_cache:
-            log.info("Site already exists: %s", name)
-            existing = site_cache[name]
+        if title in site_cache:
+            log.info("Site already exists: %s", title)
+            existing = site_cache[title]
+            site_ids_by_netbox_name[netbox_name] = existing["id"]
 
             changes = {}
             if nb_lat is not None and nb_lon is not None and (
@@ -671,12 +748,12 @@ def sync_sites(kentik, netbox_sites, container_prefixes_by_site=None, limit=None
                 continue
 
             if limit is not None and touched >= limit:
-                log.info("Site limit (%d) reached; skipping update for: %s", limit, name)
+                log.info("Site limit (%d) reached; skipping update for: %s", limit, title)
                 continue
 
             log.info(
                 "Site %s: %s; updating",
-                name, "; ".join(f"{field} drifted ({diff})" for field, diff in changes.items()),
+                title, "; ".join(f"{field} drifted ({diff})" for field, diff in changes.items()),
             )
             updated_site = dict(existing)
             if "lat/lon" in changes:
@@ -689,28 +766,29 @@ def sync_sites(kentik, netbox_sites, container_prefixes_by_site=None, limit=None
             try:
                 kentik.update_site(existing["id"], updated_site)
             except RuntimeError as exc:
-                _record_failure(failures, "sites", name, exc)
+                _record_failure(failures, "sites", title, exc)
                 continue
             existing.update(updated_site)
             touched += 1
             continue
 
         if limit is not None and touched >= limit:
-            log.info("Site limit (%d) reached; skipping site: %s", limit, name)
+            log.info("Site limit (%d) reached; skipping site: %s", limit, title)
             continue
 
         try:
-            kentik.ensure_site(
-                title=name, lat=nb_lat or 0.0, lon=nb_lon or 0.0,
+            new_id = kentik.ensure_site(
+                title=title, lat=nb_lat or 0.0, lon=nb_lon or 0.0,
                 user_access_networks=nb_networks, site_cache=site_cache,
             )
         except RuntimeError as exc:
-            _record_failure(failures, "sites", name, exc)
+            _record_failure(failures, "sites", title, exc)
             continue
         touched += 1
+        site_ids_by_netbox_name[netbox_name] = new_id
 
     log.info("Phase 1 complete. %d sites in Kentik.", len(site_cache))
-    return {title: meta["id"] for title, meta in site_cache.items()}
+    return site_ids_by_netbox_name
 
 
 # ---------------------------------------------------------------------------
@@ -1059,11 +1137,19 @@ def main():
 
     if run_sites:
         site_cache = sync_sites(kentik, netbox_sites, container_prefixes_by_site=site_networks,
-                                 limit=cfg.limit, failures=failures)
+                                 limit=cfg.limit, failures=failures,
+                                 site_name_template=cfg.site_name_template)
     elif run_devices:
         # Devices still need to resolve existing sites, just without Phase 1's
-        # create/update logic running.
-        site_cache = {title: meta["id"] for title, meta in kentik.get_sites().items()}
+        # create/update logic running. NetBox device records only carry their
+        # site's plain name, so bridge Kentik's title-keyed sites back to
+        # NetBox names via the same template Phase 1 would have used.
+        kentik_sites_by_title = kentik.get_sites()
+        site_cache = {}
+        for nb_site in netbox_sites:
+            title = resolve_site_name(nb_site, cfg.site_name_template)
+            if title in kentik_sites_by_title:
+                site_cache[nb_site["name"]] = kentik_sites_by_title[title]["id"]
     else:
         site_cache = {}
 
