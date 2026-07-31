@@ -58,6 +58,41 @@ class TestNmsAgentTag:
 
 
 # ---------------------------------------------------------------------------
+# get_config
+# ---------------------------------------------------------------------------
+
+CONFIG_ARGV = [
+    "netbox_sync.py",
+    "--kentik-email", "e@x.com",
+    "--kentik-token", "tok",
+    "--netbox-url", "http://netbox.test",
+    "--netbox-token", "nbtok",
+]
+
+
+class TestGetConfigPlanRequirement:
+    def test_plan_required_for_default_full_run(self, monkeypatch):
+        monkeypatch.setattr(sys, "argv", CONFIG_ARGV)
+        with pytest.raises(SystemExit, match="KENTIK_PLAN_NAME"):
+            ns.get_config()
+
+    def test_plan_required_for_only_devices(self, monkeypatch):
+        monkeypatch.setattr(sys, "argv", CONFIG_ARGV + ["--only", "devices"])
+        with pytest.raises(SystemExit, match="KENTIK_PLAN_NAME"):
+            ns.get_config()
+
+    def test_plan_not_required_for_only_sites(self, monkeypatch):
+        monkeypatch.setattr(sys, "argv", CONFIG_ARGV + ["--only", "sites"])
+        cfg = ns.get_config()
+        assert cfg.kentik_plan is None
+
+    def test_plan_not_required_for_only_labels(self, monkeypatch):
+        monkeypatch.setattr(sys, "argv", CONFIG_ARGV + ["--only", "labels"])
+        cfg = ns.get_config()
+        assert cfg.kentik_plan is None
+
+
+# ---------------------------------------------------------------------------
 # kentik_request
 # ---------------------------------------------------------------------------
 
@@ -776,3 +811,18 @@ class TestEndToEnd:
         methods = [(r.method, r.path) for r in requests_mock.request_history]
         assert ("POST", LABELS_PATH) in methods
         assert ("GET", check_device_path("rtr1")) not in methods
+
+    def test_only_sites_runs_without_a_plan_name(self, requests_mock, monkeypatch):
+        _register_netbox(requests_mock, sites=[{"name": "DC1", "latitude": 1.0, "longitude": 2.0}])
+        requests_mock.get(f"{KENTIK_BASE}{SITES_PATH}", json={"sites": []})
+        requests_mock.post(f"{KENTIK_BASE}{SITES_PATH}", json={"site": {"id": "501"}})
+        # Deliberately not registering GET /plans: --only sites with no
+        # --kentik-plan must never look up a plan, so NoMockAddress would
+        # fail this test if it tried.
+
+        argv = [a for a in BASE_ARGV if a not in ("--kentik-plan", "MyPlan")]
+        monkeypatch.setattr(sys, "argv", argv + ["--only", "sites"])
+        ns.main()
+
+        methods = [(r.method, r.path) for r in requests_mock.request_history]
+        assert ("POST", SITES_PATH) in methods

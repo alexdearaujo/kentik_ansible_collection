@@ -13,7 +13,8 @@ Configuration (env vars or CLI flags):
   KENTIK_TOKEN          Kentik API token                --kentik-token
   NETBOX_URL            NetBox base URL                 --netbox-url
   NETBOX_TOKEN          NetBox API token (v1 or v2)     --netbox-token
-  KENTIK_PLAN_NAME      Kentik plan name                --kentik-plan
+  KENTIK_PLAN_NAME      Kentik plan name (required only --kentik-plan
+                        when the devices phase runs)
   KENTIK_REGION         US or EU (default: US)          --kentik-region
   KENTIK_SNMP_COMMUNITY SNMP community string           --snmp-community
   KENTIK_SNMP_CRED      SNMP credential name            --snmp-credential
@@ -151,8 +152,11 @@ def get_config():
         ("KENTIK_TOKEN", "kentik_token"),
         ("NETBOX_URL", "netbox_url"),
         ("NETBOX_TOKEN", "netbox_token"),
-        ("KENTIK_PLAN_NAME", "kentik_plan"),
     ] if not getattr(cfg, attr)]
+    # Only the devices phase assigns a plan to a device, so KENTIK_PLAN_NAME
+    # is only required when that phase will actually run.
+    if cfg.only in (None, "devices") and not cfg.kentik_plan:
+        missing.append("KENTIK_PLAN_NAME")
     if missing:
         sys.exit(f"Missing required config: {', '.join(missing)}")
 
@@ -788,8 +792,6 @@ def main():
     )
 
     kentik = KentikClient(cfg.kentik_email, cfg.kentik_token, cfg.kentik_region, dry_run=cfg.dry_run)
-    plan_id = kentik.get_plan_id(cfg.kentik_plan)
-    log.info("Kentik plan: '%s' (id=%s)", cfg.kentik_plan, plan_id)
 
     if cfg.only:
         log.info("--only %s: running just that phase", cfg.only)
@@ -797,6 +799,11 @@ def main():
     run_sites = cfg.only in (None, "sites")
     run_devices = cfg.only in (None, "devices")
     run_labels = cfg.only in (None, "labels")
+
+    plan_id = None
+    if run_devices:
+        plan_id = kentik.get_plan_id(cfg.kentik_plan)
+        log.info("Kentik plan: '%s' (id=%s)", cfg.kentik_plan, plan_id)
 
     if run_sites:
         site_cache = sync_sites(kentik, netbox_sites, limit=cfg.limit)

@@ -68,7 +68,7 @@ wins if both are given.
 | `KENTIK_TOKEN` | `--kentik-token` | Yes | Kentik API token |
 | `NETBOX_URL` | `--netbox-url` | Yes | NetBox base URL, e.g. `https://netbox.example.com` |
 | `NETBOX_TOKEN` | `--netbox-token` | Yes | NetBox API token (v1 or v2, see above) |
-| `KENTIK_PLAN_NAME` | `--kentik-plan` | Yes | Name of an existing Kentik plan to assign synced devices to |
+| `KENTIK_PLAN_NAME` | `--kentik-plan` | Only when the devices phase runs (default full run, or `--only devices`) | Name of an existing Kentik plan to assign synced devices to |
 | `KENTIK_REGION` | `--kentik-region` | No (default `US`) | `US` or `EU` |
 | `KENTIK_SNMP_COMMUNITY` | `--snmp-community` | No | SNMP community string applied to every synced device |
 | `KENTIK_SNMP_CRED` | `--snmp-credential` | No (default `default`) | SNMP credential name used for NMS-tagged devices |
@@ -189,6 +189,10 @@ of `--only`; only which Kentik-side phase(s) actually run is affected.
   result. Devices not yet present in Kentik are skipped with a warning; run
   `--only devices` (or a full run) first if you need them created.
 
+`KENTIK_PLAN_NAME` / `--kentik-plan` is only required when the devices phase
+actually runs (a default full run, or `--only devices`); it can be omitted for
+`--only sites` or `--only labels`.
+
 Useful when you've already synced sites and devices and only want to pick up new
 NetBox tags/roles/tenants as labels, without re-touching everything else:
 
@@ -259,8 +263,9 @@ driven against mocked HTTP (via `requests-mock`) rather than real credentials.
 ## Troubleshooting
 
 - **`Missing required config: ...`**: one of `KENTIK_EMAIL`, `KENTIK_TOKEN`,
-  `NETBOX_URL`, `NETBOX_TOKEN`, `KENTIK_PLAN_NAME` isn't set. Check your `.env` or
-  CLI flags.
+  `NETBOX_URL`, `NETBOX_TOKEN` isn't set, or `KENTIK_PLAN_NAME` isn't set and the
+  devices phase is running (default full run, or `--only devices`). Check your
+  `.env` or CLI flags.
 - **`NetBox GET ... returned 403: {"detail":"Authentication credentials were not
   provided."}` / `"Invalid v1 token"`**: check `NETBOX_TOKEN` is current. NetBox
   demo/shared instances in particular tend to rotate or expire tokens.
