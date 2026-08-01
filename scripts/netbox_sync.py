@@ -148,7 +148,11 @@ Label sources:
   Fields: name, slug. A source left out of the spec entirely is neither created nor
   assigned (e.g. "role:slug,tenant:slug" drops tags without touching the code).
   Default: "role:slug,tenant:slug,tag:slug" (today's behavior). A spec referencing an
-  unsupported source or field is rejected at startup.
+  unsupported source or field is rejected at startup. Every label's display text is
+  prefixed with its source type, e.g. a device role "core" becomes label
+  "role:core", tenant "Acme Corp" becomes "tenant:Acme Corp", tag "prod" becomes
+  "tag:prod" -- this keeps labels from different sources from ever colliding and
+  makes the source obvious at a glance in Kentik.
 """
 
 import argparse
@@ -1073,6 +1077,17 @@ def _label_key(value):
     return value.lower() if value else None
 
 
+def _prefixed_label_value(source, value):
+    """Build a label's display text with its source-type prefix, e.g.
+    "role:core" or "tenant:Acme Corp" or "tag:prod", so labels from
+    different NetBox object types can't collide and it's clear in Kentik
+    which kind of label one is. Returns None if value is missing/empty, so
+    callers treat that the same as "no label for this dimension" instead of
+    creating one literally named e.g. "role:None".
+    """
+    return f"{source}:{value}" if value else None
+
+
 def sync_labels(kentik, netbox_devices, netbox_roles, netbox_tenants, netbox_tags, device_ids,
                  limit=None, skip_assignment=False, failures=None, label_sources=None):
     """Create labels from NetBox metadata and, unless skip_assignment, assign them to devices.
@@ -1117,11 +1132,15 @@ def sync_labels(kentik, netbox_devices, netbox_roles, netbox_tenants, netbox_tag
             created += 1
 
     # --- Create labels ---
+    # Every label's display text is prefixed with its source type
+    # ("role:core", "tenant:Acme Corp", "tag:prod") so labels from different
+    # NetBox object types can never collide and it's obvious in Kentik which
+    # kind of label one is.
     if "role" in label_sources:
         field = label_sources["role"]
         log.info("Ensuring role labels (using %s)...", field)
         for role in netbox_roles:
-            value = role.get(field)
+            value = _prefixed_label_value("role", role.get(field))
             if not value:
                 continue
             color = f"#{role.get('color', '808080')}"
@@ -1133,7 +1152,7 @@ def sync_labels(kentik, netbox_devices, netbox_roles, netbox_tenants, netbox_tag
         field = label_sources["tenant"]
         log.info("Ensuring tenant labels (using %s)...", field)
         for tenant in netbox_tenants:
-            value = tenant.get(field)
+            value = _prefixed_label_value("tenant", tenant.get(field))
             if not value:
                 continue
             ensure_within_budget(value, "#00ff00")
@@ -1146,7 +1165,7 @@ def sync_labels(kentik, netbox_devices, netbox_roles, netbox_tenants, netbox_tag
         for tag in netbox_tags:
             if tag.get("name", "").startswith(NMS_AGENT_TAG):
                 continue  # internal control tag, not a metadata label
-            value = tag.get(field)
+            value = _prefixed_label_value("tag", tag.get(field))
             if not value:
                 continue
             color = f"#{tag.get('color', '808080')}"
@@ -1182,12 +1201,14 @@ def sync_labels(kentik, netbox_devices, netbox_roles, netbox_tenants, netbox_tag
         desired = []
 
         if "role" in label_sources and nb_device.get("role"):
-            key = _label_key(nb_device["role"].get(label_sources["role"]))
+            value = _prefixed_label_value("role", nb_device["role"].get(label_sources["role"]))
+            key = _label_key(value)
             if key in label_cache:
                 desired.append(label_cache[key])
 
         if "tenant" in label_sources and nb_device.get("tenant"):
-            key = _label_key(nb_device["tenant"].get(label_sources["tenant"]))
+            value = _prefixed_label_value("tenant", nb_device["tenant"].get(label_sources["tenant"]))
+            key = _label_key(value)
             if key in label_cache:
                 desired.append(label_cache[key])
 
@@ -1196,7 +1217,7 @@ def sync_labels(kentik, netbox_devices, netbox_roles, netbox_tenants, netbox_tag
             for tag in nb_device.get("tags", []):
                 if tag.get("name", "").startswith(NMS_AGENT_TAG):
                     continue
-                key = _label_key(tag.get(field))
+                key = _label_key(_prefixed_label_value("tag", tag.get(field)))
                 if key in label_cache:
                     desired.append(label_cache[key])
 

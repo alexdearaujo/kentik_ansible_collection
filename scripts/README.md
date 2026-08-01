@@ -125,6 +125,12 @@ and how they're labeled can be adjusted without touching the script. A spec nami
 unsupported source (only `role`, `tenant`, and `tag` are valid) or field (only `name`
 and `slug` are valid) is rejected at startup with a clear error.
 
+Every label's display text is prefixed with its source type, so a device role
+`core` becomes the Kentik label `role:core`, tenant `Acme Corp` becomes
+`tenant:Acme Corp`, and tag `prod` becomes `tag:prod`. This keeps labels from
+different sources from ever colliding (e.g. a role and a tag that happen to share
+a slug) and makes each label's origin obvious at a glance in Kentik.
+
 ## Requirements
 
 This repo uses [uv](https://docs.astral.sh/uv/) to manage the Python environment.

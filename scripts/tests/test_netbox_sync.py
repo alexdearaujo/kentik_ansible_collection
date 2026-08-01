@@ -181,6 +181,23 @@ class TestParseLabelSources:
             ns.parse_label_sources("role")
 
 
+class TestPrefixedLabelValue:
+    def test_prefixes_role(self):
+        assert ns._prefixed_label_value("role", "core") == "role:core"
+
+    def test_prefixes_tenant(self):
+        assert ns._prefixed_label_value("tenant", "Acme Corp") == "tenant:Acme Corp"
+
+    def test_prefixes_tag(self):
+        assert ns._prefixed_label_value("tag", "prod") == "tag:prod"
+
+    def test_returns_none_for_missing_value(self):
+        assert ns._prefixed_label_value("role", None) is None
+
+    def test_returns_none_for_empty_value(self):
+        assert ns._prefixed_label_value("role", "") is None
+
+
 class TestFormatFailuresTable:
     def test_renders_box_drawing_table_with_header_and_rows(self):
         failures = [
@@ -1054,7 +1071,7 @@ class TestSyncLabelsMixedIdTypes:
         # created this run (negative int placeholder id from ensure_label's
         # dry-run path). Comparing/sorting that mix must not raise TypeError.
         kentik = MagicMock()
-        kentik.get_labels.return_value = {"core": "10", "new-tag": -1}
+        kentik.get_labels.return_value = {"role:core": "10", "tag:new-tag": -1}
         kentik.get_device_label_ids.return_value = ["10"]
         devices = [{"name": "rtr1", "role": {"slug": "core"}, "tenant": None,
                     "tags": [{"slug": "new-tag", "name": "new-tag"}]}]
@@ -1070,7 +1087,7 @@ class TestSyncLabelsMixedIdTypes:
         # (e.g. a placeholder id from a still-pending dry-run site); nothing
         # should be re-sent, and comparing them must not crash either.
         kentik = MagicMock()
-        kentik.get_labels.return_value = {"core": -1}
+        kentik.get_labels.return_value = {"role:core": -1}
         kentik.get_device_label_ids.return_value = [-1]
         devices = [{"name": "rtr1", "role": {"slug": "core"}, "tenant": None, "tags": []}]
         ns.sync_labels(kentik, netbox_devices=devices, netbox_roles=[], netbox_tenants=[],
@@ -1089,7 +1106,7 @@ class TestSyncLabelsLimit:
 
     def test_limits_device_label_assignments(self):
         kentik = MagicMock()
-        kentik.get_labels.return_value = {"core": "10"}
+        kentik.get_labels.return_value = {"role:core": "10"}
         kentik.get_device_label_ids.return_value = []
         devices = [{"name": f"rtr{i}", "role": {"slug": "core"}, "tenant": None, "tags": []}
                    for i in range(5)]
@@ -1103,7 +1120,7 @@ class TestSyncLabelsLimit:
         kentik.get_labels.return_value = {}
         devices = [{"name": "rtr0", "role": None, "tenant": None, "tags": []},
                    {"name": "rtr1", "role": {"slug": "core"}, "tenant": None, "tags": []}]
-        kentik.get_labels.return_value = {"core": "10"}
+        kentik.get_labels.return_value = {"role:core": "10"}
         kentik.get_device_label_ids.return_value = []
         device_ids = {"rtr0": "1", "rtr1": "2"}
         ns.sync_labels(kentik, netbox_devices=devices, netbox_roles=[], netbox_tenants=[],
@@ -1113,7 +1130,7 @@ class TestSyncLabelsLimit:
 
     def test_unnamed_device_is_skipped_without_crashing(self):
         kentik = MagicMock()
-        kentik.get_labels.return_value = {"core": "10"}
+        kentik.get_labels.return_value = {"role:core": "10"}
         kentik.get_device_label_ids.return_value = []
         devices = [
             {"id": 42, "name": None, "role": {"slug": "core"}, "tenant": None, "tags": []},
@@ -1134,7 +1151,7 @@ class TestSyncLabelsLimit:
         # mocked no-op here; the real impl would just no-op internally too),
         # which is enough to prove ordering without depending on the mock
         # mutating label_cache the way the real client would.
-        kentik.get_labels.return_value = {"core": "10"}
+        kentik.get_labels.return_value = {"role:core": "10"}
         kentik.check_device.return_value = "10"
         kentik.get_device_label_ids.return_value = []
         roles = [{"slug": "core", "color": "ff0000"}]
@@ -1196,7 +1213,7 @@ class TestSyncLabelsFailures:
         ns.sync_labels(kentik, netbox_devices=[], netbox_roles=roles, netbox_tenants=[],
                         netbox_tags=[], device_ids={}, limit=None, failures=failures)
         assert kentik.ensure_label.call_count == 2
-        assert failures == [{"phase": "labels: create", "item": "bad-role", "reason": "rejected"}]
+        assert failures == [{"phase": "labels: create", "item": "role:bad-role", "reason": "rejected"}]
 
     def test_failed_label_create_does_not_consume_limit_budget(self):
         kentik = MagicMock()
@@ -1209,7 +1226,7 @@ class TestSyncLabelsFailures:
 
     def test_failed_assignment_is_recorded_and_does_not_stop_other_devices(self):
         kentik = MagicMock()
-        kentik.get_labels.return_value = {"core": "10"}
+        kentik.get_labels.return_value = {"role:core": "10"}
         kentik.get_device_label_ids.side_effect = [RuntimeError("kentik unreachable"), []]
         devices = [
             {"name": "bad-rtr", "role": {"slug": "core"}, "tenant": None, "tags": []},
@@ -1235,7 +1252,7 @@ class TestSyncLabelsSources:
         ns.sync_labels(kentik, netbox_devices=[], netbox_roles=roles, netbox_tenants=tenants,
                         netbox_tags=tags, device_ids={}, limit=None)
         created_names = {call.args[0] for call in kentik.ensure_label.call_args_list}
-        assert created_names == {"core", "acme", "prod"}
+        assert created_names == {"role:core", "tenant:acme", "tag:prod"}
 
     def test_dropping_tag_source_creates_no_tag_labels(self):
         kentik = MagicMock()
@@ -1258,14 +1275,14 @@ class TestSyncLabelsSources:
 
     def test_tenant_by_name_creates_and_assigns_using_the_name(self):
         kentik = MagicMock()
-        kentik.get_labels.return_value = {"acme corp": "50"}
+        kentik.get_labels.return_value = {"tenant:acme corp": "50"}
         kentik.get_device_label_ids.return_value = []
         devices = [{"name": "rtr1", "role": None, "tenant": {"name": "Acme Corp", "slug": "acme"}, "tags": []}]
         ns.sync_labels(kentik, netbox_devices=devices, netbox_roles=[], netbox_tenants=[{"name": "Acme Corp", "slug": "acme"}],
                         netbox_tags=[], device_ids={"rtr1": "1"}, limit=None,
                         label_sources=ns.parse_label_sources("tenant:name"))
-        # Created using the raw display value...
-        kentik.ensure_label.assert_called_once_with("Acme Corp", "#00ff00", kentik.get_labels.return_value)
+        # Created using the prefixed display value...
+        kentik.ensure_label.assert_called_once_with("tenant:Acme Corp", "#00ff00", kentik.get_labels.return_value)
         # ...and matched for assignment via the same case-folded key ensure_label uses.
         kentik.set_device_labels.assert_called_once_with("1", ["50"])
 
@@ -1273,7 +1290,7 @@ class TestSyncLabelsSources:
         # Sanity check that matching really is case-insensitive end to end,
         # not just coincidentally working because slugs are lowercase.
         kentik = MagicMock()
-        kentik.get_labels.return_value = {"core switch": "77"}
+        kentik.get_labels.return_value = {"role:core switch": "77"}
         kentik.get_device_label_ids.return_value = []
         devices = [{"name": "rtr1", "role": {"name": "CORE SWITCH", "slug": "core-switch"}, "tenant": None, "tags": []}]
         ns.sync_labels(kentik, netbox_devices=devices, netbox_roles=[], netbox_tenants=[],
@@ -1625,7 +1642,7 @@ class TestEndToEnd:
 
         label_creates = [r.json()["label"]["name"] for r in requests_mock.request_history
                           if r.method == "POST" and r.path == LABELS_PATH]
-        assert set(label_creates) == {"core", "Acme Corp"}  # "prod" excluded: tags dropped from sources
+        assert set(label_creates) == {"role:core", "tenant:Acme Corp"}  # "tag:prod" excluded: tags dropped
 
     def test_site_flag_scopes_fetch_and_sync_to_one_site(self, requests_mock, monkeypatch):
         requests_mock.get(
