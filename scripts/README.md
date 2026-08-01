@@ -38,21 +38,42 @@ device itself).
 
 ### Device update visibility
 
-When a NetBox device already exists in Kentik, the script fetches its current state
-before updating it and compares each field it manages (`deviceDescription`,
-`deviceSubtype`, `deviceSampleRate`, `deviceBgpType`, `minimizeSnmp`, `sendingIps`,
-`deviceSnmpIp`, `deviceSnmpCommunity`, site, and plan) against what this run would
-send. The log line for that update spells out exactly which fields differ:
+Phase 2 reads every existing Kentik device once, in bulk (see
+[Batching and scale](#batching-and-scale)), and compares each NetBox device against
+that state field by field (`deviceDescription`, `deviceSubtype`, `deviceSampleRate`,
+`deviceBgpType`, `minimizeSnmp`, `sendingIps`, `deviceSnmpIp`, `deviceSnmpCommunity`,
+site, and plan). The log line for a device that's actually being updated spells out
+exactly which fields differ:
 
 ```text
 Updating device rtr1 (id=410680): deviceDescription 'old desc' -> 'new desc'; siteId 12 -> 36515
 ```
 
-If nothing actually differs, the line says `(no field changes detected)` instead
-(the update call still happens either way; this only changes what's logged). NMS
-agent configuration can't be compared this way, since Kentik doesn't echo it back
-in the same shape it's written in, so it's only flagged as `NMS agent config
-included (not diffed)` rather than diffed field by field.
+If nothing actually differs, the device is logged as already up to date and left
+alone entirely; no update call is sent for it. NMS agent configuration can't be
+compared this way, since Kentik doesn't echo it back in the same shape it's written
+in, so it's only flagged as `NMS agent config included (not diffed)` rather than
+diffed field by field.
+
+### Batching and scale
+
+Phase 2 and Phase 3 both read Kentik's current device state with a single bulk
+request instead of one lookup per NetBox device, and Phase 2 sends creates and
+updates in batches of up to 100 devices via Kentik's `batch_create`/`batch_update`
+device endpoints instead of one request per device. This keeps the number of Kentik
+API calls roughly constant regardless of inventory size, at a few calls per phase
+instead of several per device, which matters once NetBox holds thousands of active
+devices.
+
+Trade-off: Kentik's batch endpoints report a failed device by name (create) or ID
+(update) only, with no per-device reason, so a device rejected as part of a batch
+shows up in the end-of-run failure table with a generic reason instead of a specific
+one. A batch call that fails outright (network error, non-2xx response) is treated as
+every device in that batch having failed, and all of them are retried on the next run
+(every phase is still idempotent). Device label assignment (Phase 3) has no bulk
+endpoint in the Kentik API, so it's still one `PUT` per device that actually needs a
+label change; a device already carrying the labels this run would set costs no call
+at all.
 
 ### Site naming
 
@@ -262,13 +283,20 @@ uv run --env-file .env python scripts/netbox_sync.py --dry-run --limit 5
 single run:
 
 - at most `N` sites created or updated,
-- `N` devices processed (created or updated),
+- `N` devices submitted for creation or update,
 - `N` new labels created,
 - `N` devices whose label assignments are touched.
 
 Each phase gets its own independent budget of `N`; it's not one shared counter
 across the whole run. Items that don't require a mutation (an already-existing site
-with matching lat/lon, a device with no labels to assign) don't consume the budget.
+with matching lat/lon, a device already matching Kentik's current state, a device
+with no labels to assign) don't consume the budget.
+
+For devices specifically, `N` counts devices *submitted* to Kentik's batch
+create/update endpoints, not devices confirmed successful: the batch is assembled and
+capped at `N` before any of it is sent, so a device Kentik later rejects still counts
+against the budget. Sites and labels don't have this caveat, since each item's
+outcome is known before the next one is considered.
 
 This is meant for smoke-testing a change against a small, cheap subset before
 running it against your full inventory. Combine it with `--dry-run` for the safest
@@ -296,10 +324,10 @@ phase(s) actually run is affected.
   does not run, so a device whose NetBox site doesn't exist in Kentik yet will still
   be skipped with a warning.
 - **`--only labels`**: create labels and assign them to devices only. Since Phase 2
-  didn't just run, each device's Kentik ID is resolved with an individual lookup
-  (one extra API read per NetBox device) instead of reusing Phase 2's in-memory
-  result. Devices not yet present in Kentik are skipped with a warning; run
-  `--only devices` (or a full run) first if you need them created.
+  didn't just run, each device's Kentik ID is resolved from Phase 3's own bulk device
+  read instead of reusing an in-memory result from Phase 2. Devices not yet present
+  in Kentik are skipped with a warning; run `--only devices` (or a full run) first if
+  you need them created.
 
 `KENTIK_PLAN_NAME` / `--kentik-plan` is only required when the devices phase
 actually runs (a default full run, or `--only devices`); it can be omitted for
@@ -341,9 +369,10 @@ uv run --env-file .env python scripts/netbox_sync.py --only labels --skip-label-
 ```
 
 `--skip-label-assignment` creates labels in Kentik as usual (from whichever sources
-`--label-sources` selects) but never assigns them to any device. It also skips
-resolving device IDs entirely, since that work only exists to support assignment.
-Useful for making sure the label set exists in Kentik without touching any device.
+`--label-sources` selects) but never assigns them to any device. It also skips the
+bulk device read used to resolve device IDs and current label state, since that work
+only exists to support assignment. Useful for making sure the label set exists in
+Kentik without touching any device.
 
 ## More examples
 
@@ -381,6 +410,31 @@ flags always win over env vars):
 ```bash
 uv run --env-file .env python scripts/netbox_sync.py --kentik-plan "Staging Plan"
 ```
+
+## Run summary
+
+Every run prints a summary table just before exiting, whether it succeeded or failed:
+one row per phase that actually ran, timed individually, plus a final `total` row for
+the whole job:
+
+```text
+┌─────────┬──────────┬───────────────────────────────────────────────────────────┐
+│ Phase   │ Duration │ Summary                                                   │
+├─────────┼──────────┼───────────────────────────────────────────────────────────┤
+│ sites   │ 2.1s     │ created=3 updated=1 unchanged=41 failed=0                 │
+│ devices │ 1m 14.3s │ created=45 updated=102 unchanged=19850 failed=3           │
+│ labels  │ 8.4s     │ labels: created=5 unchanged=40 failed=0; assignments:     │
+│         │          │ set=120 unchanged=19700 failed=2                         │
+│ total   │ 1m 24.8s │                                                           │
+└─────────┴──────────┴───────────────────────────────────────────────────────────┘
+```
+
+A phase skipped by `--only` gets no row at all. `created`/`updated` count only what
+Kentik actually confirmed, not merely submitted (for devices under `--limit`, that's
+not quite the same thing -- see [Limit mode](#limit-mode)); `unchanged` counts items
+already in sync that were left alone entirely. `failed` counts are cross-referenced
+from the same failures listed in the per-item table below (see next section), so the
+two numbers can never drift apart.
 
 ## Per-item failures
 

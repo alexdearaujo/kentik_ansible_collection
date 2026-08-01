@@ -65,10 +65,14 @@ Dry-run mode:
 
 Limit mode:
   --limit N caps the number of mutating operations performed *per phase* in a single
-  run: at most N sites created or updated, N devices processed (created or updated),
+  run: at most N sites created or updated, N devices submitted for creation or update,
   N new labels, and N devices whose label assignments are touched. Useful for
   smoke-testing a change against a small subset before running it against the full
-  inventory.
+  inventory. For devices specifically, N counts devices *submitted* to Kentik's batch
+  create/update endpoints, not devices confirmed successful -- since the whole batch
+  is assembled and capped at N before any of it is sent, a device Kentik later rejects
+  still counts against the budget (unlike sites and labels, where each item's outcome
+  is known before the next one is considered).
 
 Running a single phase:
   --only {sites,devices,labels} runs just one phase instead of the full
@@ -78,9 +82,9 @@ Running a single phase:
                (read-only) to resolve each device's siteId, but Phase 1's
                create/update logic does not run.
     - labels:  create labels and assign them to devices only. Since Phase 2
-               did not just run, each device's Kentik ID is looked up
-               individually (one extra read per NetBox device) instead of
-               reusing the in-memory result from Phase 2.
+               did not just run, each device's Kentik ID is resolved from
+               Phase 3's own bulk device read instead of reusing an
+               in-memory result from Phase 2.
   NetBox data is always fetched in full regardless of --only (except for any
   narrowing --site does; see below); only which Kentik-side phase(s) run is
   affected.
@@ -98,9 +102,27 @@ Scoping to a single site:
 
 Skipping label assignment:
   --skip-label-assignment creates labels in Kentik as usual but never assigns them to
-  any device. This also skips resolving device IDs entirely (no per-device lookup),
-  since that work only exists to support assignment. Combine with --only labels to do
-  nothing but ensure the label set exists in Kentik.
+  any device. This also skips the bulk device read used to resolve device IDs and
+  current label state, since that work only exists to support assignment. Combine
+  with --only labels to do nothing but ensure the label set exists in Kentik.
+
+Batching:
+  Phase 2 reads every existing Kentik device with a single bulk request (rather than
+  one lookup per NetBox device) and sends creates and updates in batches of up to
+  DEVICE_BATCH_MAX (100) devices via Kentik's batch_create/batch_update endpoints,
+  instead of one request per device. Phase 3 similarly reads current device state
+  (for ID resolution and existing label assignments) with a single bulk request. This
+  keeps the number of Kentik API calls roughly constant regardless of inventory size
+  (a handful of calls per phase instead of several per device), which matters at
+  scale: a run against a ~20k-device NetBox instance would otherwise issue tens of
+  thousands of individual HTTP calls. Kentik's batch endpoints report failures by
+  name (create) or ID (update) only, with no per-device reason, so a device rejected
+  as part of a batch is recorded in the failure summary with a generic reason instead
+  of a specific one; a batch call that fails outright (network error, non-2xx) is
+  treated as every device in that batch having failed. Device label assignment
+  (Phase 3) is still sent one PUT per device that actually needs a change, since
+  Kentik has no bulk label-assignment endpoint; a device already carrying the
+  labels this run would set is left untouched and doesn't cost a call at all.
 
 Network errors:
   A transient network failure (DNS, connection refused/unreachable, timeout) talking
@@ -114,19 +136,41 @@ Per-item failures:
   If a single site, device, or label create/update/assignment fails (e.g. a bad
   value rejected by Kentik, or retries exhausted for that one call), the error is
   logged immediately and the run continues with the remaining items rather than
-  aborting the whole phase. Every recorded failure is listed in a summary table
-  printed at the end of the run, with the reason reduced to Kentik/NetBox's own
-  error message (instead of the raw HTTP wrapper) so it's readable at a glance.
-  The script exits with a non-zero status if there was at least one failure.
-  Since every phase is idempotent, simply re-running the same command retries
-  only what failed (everything else is already in sync).
+  aborting the whole phase. Every recorded failure is listed in a table printed at
+  the end of the run, with the reason reduced to Kentik/NetBox's own error message
+  (instead of the raw HTTP wrapper) so it's readable at a glance. The script exits
+  with a non-zero status if there was at least one failure. Since every phase is
+  idempotent, simply re-running the same command retries only what failed
+  (everything else is already in sync).
+
+Run summary:
+  Every run prints a summary table just before exiting (success or failure), one row
+  per phase that actually ran plus a final total row:
+
+    ┌─────────┬──────────┬──────────────────────────────────────────────────────────┐
+    │ Phase   │ Duration │ Summary                                                  │
+    ├─────────┼──────────┼──────────────────────────────────────────────────────────┤
+    │ sites   │ 2.1s     │ created=3 updated=1 unchanged=41 failed=0                │
+    │ devices │ 1m 14.3s │ created=45 updated=102 unchanged=19850 failed=3          │
+    │ labels  │ 8.4s     │ labels: created=5 unchanged=40 failed=0; assignments:    │
+    │         │          │ set=120 unchanged=19700 failed=2                         │
+    │ total   │ 1m 24.8s │                                                          │
+    └─────────┴──────────┴──────────────────────────────────────────────────────────┘
+
+  "created"/"updated" counts only items Kentik actually confirmed (not merely
+  submitted -- see Batching above for why that distinction matters for devices under
+  --limit); "unchanged" counts items already in sync that were left alone entirely;
+  "failed" counts are cross-referenced from the same failures also detailed in the
+  per-item failure table below it, rather than tracked separately, so the two can
+  never drift apart. A phase --only skipped from running has no row at all.
 
 Device update visibility:
-  Before updating an existing device, its current state is fetched from Kentik and
-  compared field by field against what this run would send; the log line for that
-  update names exactly which fields differ and their old -> new values (or says so
-  explicitly if nothing actually changed). NMS agent config can't be compared this
-  way, so it's only flagged as present rather than diffed.
+  Every existing device's current state (read in Phase 2's bulk device fetch; see
+  Batching above) is compared field by field against what this run would send; the
+  log line for a device actually being updated names exactly which fields differ and
+  their old -> new values. A device whose state already matches is logged and left
+  alone entirely -- no update call is sent for it. NMS agent config can't be compared
+  this way, so it's only flagged as present rather than diffed.
 
 Site naming:
   --site-name-template controls the Kentik site title, as a str.format template over
@@ -418,6 +462,11 @@ KENTIK_SITES_PATH = "/site/v202509/sites"
 KENTIK_LABELS_PATH = "/label/v202210/labels"
 KENTIK_DEVICE_PATH = "/device/v202504beta2/device"
 
+# Kentik's batch_create/batch_update device endpoints accept at most this many
+# devices per call (see https://github.com/kentik/api-schema-public, device
+# service, CreateDevices/UpdateDevices RPCs); larger runs are chunked.
+DEVICE_BATCH_MAX = 100
+
 
 class KentikClient:
     def __init__(self, email, token, region="US", dry_run=False):
@@ -567,12 +616,18 @@ class KentikClient:
 
     # ---- Devices ----
 
-    def check_device(self, device_name):
-        """Return the Kentik device ID if it exists, else None."""
-        resp = kentik_request("GET", f"{self._v5}/device/{device_name.lower()}", self._h)
+    def list_devices(self):
+        """Return {device_name.lower(): device_dict} for every device in Kentik.
+
+        device_dict is the full DeviceDetailed object Kentik returns (id,
+        labels, site, plan, ...), so a single call can serve both diffing
+        existing devices (Phase 2) and reading current label assignments
+        (Phase 3) without a per-device GET for either.
+        """
+        resp = kentik_request("GET", f"{self._base}{KENTIK_DEVICE_PATH}", self._h)
         if resp is None:
-            return None
-        return resp.json()["device"]["id"]
+            raise RuntimeError(f"Kentik GET {KENTIK_DEVICE_PATH} returned 404: check API base URL/region")
+        return {device["deviceName"].lower(): device for device in resp.json().get("devices", [])}
 
     def _dry_run_site_note(self, device_obj, site_title):
         """Explain a placeholder siteId in a dry-run log line, if there is one."""
@@ -583,58 +638,80 @@ class KentikClient:
             return f" [site '{site_title}' is itself pending creation; placeholder siteId={site_id}]"
         return f" [site '{site_title}']"
 
-    def create_device(self, device_obj, site_title=None):
+    def batch_create_devices(self, device_specs):
+        """Create devices via POST .../batch_create. device_specs is
+        [(device_obj, site_title), ...] and must not exceed DEVICE_BATCH_MAX
+        entries (callers are responsible for chunking).
+
+        Returns (created, failed_names): created is {name.lower(): id} for
+        every device Kentik reports as created; failed_names is the set of
+        device names (as sent) Kentik reports it could not create. Kentik's
+        batch response doesn't include a per-device reason, only the name, so
+        that's all a caller has to report for those.
+
+        Raises RuntimeError if the HTTP call itself fails (network error, non-2xx,
+        404) -- in that case Kentik processed none of the batch, so every device
+        in it should be treated as failed by the caller.
+        """
         if self.dry_run:
-            log.info(
-                "[DRY-RUN] Would create device%s: %s",
-                self._dry_run_site_note(device_obj, site_title),
-                json.dumps(device_obj, indent=2, sort_keys=True),
-            )
-            return self._next_dry_run_id()
+            created = {}
+            for device_obj, site_title in device_specs:
+                log.info(
+                    "[DRY-RUN] Would create device%s: %s",
+                    self._dry_run_site_note(device_obj, site_title),
+                    json.dumps(device_obj, indent=2, sort_keys=True),
+                )
+                created[device_obj["deviceName"].lower()] = self._next_dry_run_id()
+            return created, set()
 
         resp = kentik_request(
-            "POST", f"{self._base}{KENTIK_DEVICE_PATH}", self._h,
-            {"device": device_obj}
+            "POST", f"{self._base}{KENTIK_DEVICE_PATH}/batch_create", self._h,
+            {"devices": [device_obj for device_obj, _ in device_specs]},
         )
         if resp is None:
-            raise RuntimeError(f"Kentik POST {KENTIK_DEVICE_PATH} returned 404 for device '{device_obj.get('deviceName')}'")
-        return resp.json()["device"]["id"]
+            raise RuntimeError(f"Kentik POST {KENTIK_DEVICE_PATH}/batch_create returned 404")
+        body = resp.json()
+        created = {device["deviceName"].lower(): device["id"] for device in body.get("devices", [])}
+        failed_names = set(body.get("failedDevices", []))
+        return created, failed_names
 
-    def update_device(self, device_id, device_obj, site_title=None):
-        device_obj["id"] = device_id
+    def batch_update_devices(self, device_specs):
+        """Update devices via PUT .../batch_update. device_specs is
+        [(device_obj, site_title), ...] with device_obj already carrying its
+        Kentik "id", and must not exceed DEVICE_BATCH_MAX entries (callers
+        are responsible for chunking).
+
+        Returns (updated, failed_ids): updated is {name.lower(): id} for
+        every device Kentik reports as updated; failed_ids is the set of
+        device IDs (as strings) Kentik reports it could not update. As with
+        batch_create_devices, Kentik's batch response carries no per-device
+        reason.
+
+        Raises RuntimeError if the HTTP call itself fails -- every device in
+        the batch should then be treated as failed by the caller.
+        """
         if self.dry_run:
-            log.info(
-                "[DRY-RUN] Would update device id=%s%s: %s",
-                device_id,
-                self._dry_run_site_note(device_obj, site_title),
-                json.dumps(device_obj, indent=2, sort_keys=True),
-            )
-            return device_id
+            updated = {}
+            for device_obj, site_title in device_specs:
+                log.info(
+                    "[DRY-RUN] Would update device id=%s%s: %s",
+                    device_obj["id"],
+                    self._dry_run_site_note(device_obj, site_title),
+                    json.dumps(device_obj, indent=2, sort_keys=True),
+                )
+                updated[device_obj["deviceName"].lower()] = device_obj["id"]
+            return updated, set()
 
         resp = kentik_request(
-            "PUT", f"{self._base}{KENTIK_DEVICE_PATH}/{device_id}", self._h,
-            {"device": device_obj}
+            "PUT", f"{self._base}{KENTIK_DEVICE_PATH}/batch_update", self._h,
+            {"devices": [device_obj for device_obj, _ in device_specs]},
         )
         if resp is None:
-            raise RuntimeError(f"Kentik PUT {KENTIK_DEVICE_PATH}/{device_id} returned 404")
-        return resp.json()["device"]["id"]
-
-    def get_device(self, device_id):
-        """Return the full Kentik device object for device_id."""
-        resp = kentik_request(
-            "GET", f"{self._base}{KENTIK_DEVICE_PATH}/{device_id}", self._h
-        )
-        if resp is None:
-            raise RuntimeError(f"Kentik GET {KENTIK_DEVICE_PATH}/{device_id} returned 404")
-        return resp.json()["device"]
-
-    def get_device_label_ids(self, device_id):
-        if isinstance(device_id, int) and device_id < 0:
-            # Placeholder ID for a device that only exists in this dry run, so it
-            # has no real labels to fetch yet.
-            return []
-
-        return [label["id"] for label in self.get_device(device_id).get("labels", [])]
+            raise RuntimeError(f"Kentik PUT {KENTIK_DEVICE_PATH}/batch_update returned 404")
+        body = resp.json()
+        updated = {device["deviceName"].lower(): device["id"] for device in body.get("devices", [])}
+        failed_ids = {str(x) for x in body.get("failedDevices", [])}
+        return updated, failed_ids
 
     def set_device_labels(self, device_id, label_ids):
         if self.dry_run:
@@ -757,21 +834,14 @@ def _record_failure(failures, phase, item, exc):
     failures.append({"phase": phase, "item": item, "reason": _clean_failure_reason(reason)})
 
 
-def format_failures_table(failures):
-    """Render failures as a Unicode box-drawing table with columns Phase, Item, Reason."""
-    headers = ("Phase", "Item", "Reason")
-    max_reason_len = 160
-
-    rows = []
-    for failure in failures:
-        reason = failure["reason"]
-        if len(reason) > max_reason_len:
-            reason = reason[: max_reason_len - 1] + "…"
-        rows.append((failure["phase"], failure["item"], reason))
-
+def _render_box_table(headers, rows):
+    """Render `headers` and `rows` (each a tuple of str, same length as
+    headers) as a Unicode box-drawing table. rows may be empty; the table
+    still renders with just the header borders in that case.
+    """
     widths = [
         max(len(headers[col]), max((len(row[col]) for row in rows), default=0))
-        for col in range(3)
+        for col in range(len(headers))
     ]
 
     def border(left, mid, right):
@@ -784,6 +854,39 @@ def format_failures_table(failures):
     lines.extend(row_line(row) for row in rows)
     lines.append(border("└", "┴", "┘"))
     return "\n".join(lines)
+
+
+def format_failures_table(failures):
+    """Render failures as a Unicode box-drawing table with columns Phase, Item, Reason."""
+    max_reason_len = 160
+
+    rows = []
+    for failure in failures:
+        reason = failure["reason"]
+        if len(reason) > max_reason_len:
+            reason = reason[: max_reason_len - 1] + "…"
+        rows.append((failure["phase"], failure["item"], reason))
+
+    return _render_box_table(("Phase", "Item", "Reason"), rows)
+
+
+def format_summary_table(rows):
+    """Render per-phase timing/count rows as a Unicode box-drawing table with
+    columns Phase, Duration, Summary. rows is [(phase, duration_str, summary_str), ...].
+    """
+    return _render_box_table(("Phase", "Duration", "Summary"), rows)
+
+
+def _format_duration(seconds):
+    """Render a duration in seconds as e.g. '2.3s' or '1m 14.1s'."""
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes, secs = divmod(seconds, 60)
+    return f"{int(minutes)}m {secs:.1f}s"
+
+
+def _count_failures(failures, phase):
+    return sum(1 for failure in failures if failure["phase"] == phase)
 
 
 def nms_agent_tag(nb_device):
@@ -803,7 +906,7 @@ def nms_agent_tag(nb_device):
 # ---------------------------------------------------------------------------
 
 def sync_sites(kentik, netbox_sites, container_prefixes_by_site=None, limit=None, failures=None,
-                site_name_template="{name}"):
+                site_name_template="{name}", stats=None):
     """Ensure every NetBox site exists in Kentik with matching lat/lon and
     userAccessNetworks.
 
@@ -820,6 +923,11 @@ def sync_sites(kentik, netbox_sites, container_prefixes_by_site=None, limit=None
     A site whose create/update call fails is recorded in failures (if given)
     and skipped, rather than aborting the sync of every other site.
 
+    If given, stats is filled in with {"created": N, "updated": N,
+    "unchanged": N} counts for the end-of-run summary; failures aren't
+    duplicated into it since they're already in failures, keyed by phase
+    "sites".
+
     Returns {netbox_site_name: kentik_id}, keyed by NetBox's plain site name
     (not the rendered Kentik title) since that's what a NetBox device record
     references when resolving its site.
@@ -829,7 +937,12 @@ def sync_sites(kentik, netbox_sites, container_prefixes_by_site=None, limit=None
     container_prefixes_by_site = container_prefixes_by_site or {}
     if failures is None:
         failures = []
+    if stats is None:
+        stats = {}
     touched = 0
+    created = 0
+    updated = 0
+    unchanged = 0
     site_ids_by_netbox_name = {}
 
     for nb_site in netbox_sites:
@@ -857,6 +970,7 @@ def sync_sites(kentik, netbox_sites, container_prefixes_by_site=None, limit=None
                 changes["userAccessNetworks"] = f"{existing_networks} -> {nb_networks}"
 
             if not changes:
+                unchanged += 1
                 continue
 
             if limit is not None and touched >= limit:
@@ -882,6 +996,7 @@ def sync_sites(kentik, netbox_sites, container_prefixes_by_site=None, limit=None
                 continue
             existing.update(updated_site)
             touched += 1
+            updated += 1
             continue
 
         if limit is not None and touched >= limit:
@@ -897,8 +1012,10 @@ def sync_sites(kentik, netbox_sites, container_prefixes_by_site=None, limit=None
             _record_failure(failures, "sites", title, exc)
             continue
         touched += 1
+        created += 1
         site_ids_by_netbox_name[netbox_name] = new_id
 
+    stats.update({"created": created, "updated": updated, "unchanged": unchanged})
     log.info("Phase 1 complete. %d sites in Kentik.", len(site_cache))
     return site_ids_by_netbox_name
 
@@ -948,23 +1065,69 @@ def _device_field_changes(existing_device, desired_device):
     return changes
 
 
-def sync_devices(kentik, netbox_devices, site_cache, plan_id, cfg, limit=None, failures=None):
+def _send_device_batches(specs, batch_fn, failures, failure_reason):
+    """Send `specs` ([(device_obj, site_title, name), ...]) to Kentik in
+    chunks of at most DEVICE_BATCH_MAX via batch_fn (kentik.batch_create_devices
+    or kentik.batch_update_devices). Returns {name: kentik_device_id} for
+    every device Kentik reports as succeeded.
+
+    A chunk whose HTTP call fails outright is recorded as a failure for every
+    device in that chunk (Kentik processed none of it); a chunk that Kentik
+    accepts but partially rejects is recorded per rejected device, using
+    failure_reason since Kentik's batch response carries no per-device detail.
+    Either way, the remaining chunks still get sent.
+    """
+    device_ids = {}
+    for i in range(0, len(specs), DEVICE_BATCH_MAX):
+        chunk = specs[i:i + DEVICE_BATCH_MAX]
+        names_in_chunk = [name for _, _, name in chunk]
+        try:
+            succeeded, failed = batch_fn([(device_obj, site_title) for device_obj, site_title, _ in chunk])
+        except RuntimeError as exc:
+            for name in names_in_chunk:
+                _record_failure(failures, "devices", name, exc)
+            continue
+        device_ids.update(succeeded)
+        failed = {str(x) for x in failed}
+        for device_obj, _, name in chunk:
+            if name in failed or str(device_obj.get("id", "")) in failed:
+                _record_failure(failures, "devices", name, RuntimeError(failure_reason))
+    return device_ids
+
+
+def sync_devices(kentik, netbox_devices, site_cache, plan_id, cfg, limit=None, failures=None, stats=None):
     """Create or update every NetBox device in Kentik. Returns {name: kentik_device_id}.
 
-    A device whose create/update call fails is recorded in failures (if
-    given) and skipped, rather than aborting the sync of every other device.
+    Existing devices are read once in bulk (KentikClient.list_devices) rather
+    than with a per-device GET, and creates/updates are sent in batches of up
+    to DEVICE_BATCH_MAX via Kentik's batch_create/batch_update endpoints
+    instead of one call per device. A device whose current Kentik state
+    already matches what this run would send is left alone entirely (no API
+    call, doesn't consume the --limit budget).
+
+    A device whose batch create/update is rejected by Kentik is recorded in
+    failures (if given) and left out of the result, rather than aborting the
+    rest of the run.
+
+    If given, stats is filled in with {"created": N, "updated": N,
+    "unchanged": N} counts for the end-of-run summary ("created"/"updated"
+    count only devices Kentik actually confirmed, not merely submitted;
+    failures aren't duplicated into it since they're already in failures,
+    keyed by phase "devices").
     """
     log.info("=== Phase 2: Syncing devices (%d NetBox devices) ===", len(netbox_devices))
-    device_ids = {}
-    processed = 0
     if failures is None:
         failures = []
+    if stats is None:
+        stats = {}
+
+    existing_devices = kentik.list_devices()
+    to_create = []  # [(device_obj, site_title, name), ...]
+    to_update = []  # [(device_obj, site_title, name), ...]
+    budget = 0
+    unchanged = 0
 
     for nb_device in netbox_devices:
-        if limit is not None and processed >= limit:
-            log.info("Device limit (%d) reached; stopping further device processing", limit)
-            break
-
         device_name = nb_device.get("name")
         if not device_name:
             log.warning("Device id=%s has no name in NetBox (e.g. a virtual chassis member), skipping", nb_device.get("id"))
@@ -1014,30 +1177,48 @@ def sync_devices(kentik, netbox_devices, site_cache, plan_id, cfg, limit=None, f
         elif agent_id and not ip_address:
             log.warning("Device %s: NMS agent tag found (id=%s) but no primary IP, skipping NMS", name, agent_id)
 
-        try:
-            existing_id = kentik.check_device(name)
-            if existing_id:
-                existing_device = kentik.get_device(existing_id)
-                changes = _device_field_changes(existing_device, device_obj)
-                if changes:
-                    log.info(
-                        "Updating device %s (id=%s): %s",
-                        name, existing_id,
-                        "; ".join(f"{field} {diff}" for field, diff in changes.items()),
-                    )
-                else:
-                    log.info("Updating device: %s (id=%s) (no field changes detected)", name, existing_id)
-                kentik.update_device(existing_id, device_obj, site_title=site_name)
-                device_ids[name] = existing_id
-            else:
-                log.info("Creating device: %s", name)
-                device_ids[name] = kentik.create_device(device_obj, site_title=site_name)
-        except RuntimeError as exc:
-            _record_failure(failures, "devices", name, exc)
-            continue
+        existing = existing_devices.get(name)
+        if existing:
+            changes = _device_field_changes(existing, device_obj)
+            if not changes:
+                log.info("Device %s (id=%s) already up to date; skipping", name, existing["id"])
+                unchanged += 1
+                continue
 
-        processed += 1
+            if limit is not None and budget >= limit:
+                log.info("Device limit (%d) reached; skipping update for: %s", limit, name)
+                continue
 
+            log.info(
+                "Updating device %s (id=%s): %s",
+                name, existing["id"],
+                "; ".join(f"{field} {diff}" for field, diff in changes.items()),
+            )
+            device_obj["id"] = existing["id"]
+            to_update.append((device_obj, site_name, name))
+        else:
+            if limit is not None and budget >= limit:
+                log.info("Device limit (%d) reached; skipping device: %s", limit, name)
+                continue
+
+            log.info("Creating device: %s", name)
+            to_create.append((device_obj, site_name, name))
+
+        budget += 1
+
+    created_ids = _send_device_batches(
+        to_create, kentik.batch_create_devices, failures,
+        "batch create reported this device as failed (Kentik's batch API does not return a per-device reason)",
+    )
+    updated_ids = _send_device_batches(
+        to_update, kentik.batch_update_devices, failures,
+        "batch update reported this device as failed (Kentik's batch API does not return a per-device reason)",
+    )
+    device_ids = {}
+    device_ids.update(created_ids)
+    device_ids.update(updated_ids)
+
+    stats.update({"created": len(created_ids), "updated": len(updated_ids), "unchanged": unchanged})
     log.info("Phase 2 complete. %d devices synced.", len(device_ids))
     return device_ids
 
@@ -1045,34 +1226,6 @@ def sync_devices(kentik, netbox_devices, site_cache, plan_id, cfg, limit=None, f
 # ---------------------------------------------------------------------------
 # Phase 3 – Labels
 # ---------------------------------------------------------------------------
-
-def lookup_device_ids(kentik, netbox_devices, failures=None):
-    """Resolve {name: kentik_device_id} via an individual read per NetBox device.
-
-    Used to run Phase 3 with --only labels, where Phase 2 did not just run so
-    there's no in-memory device_ids result to reuse. A device whose lookup
-    fails (as opposed to simply not existing yet) is recorded in failures
-    (if given) and skipped.
-    """
-    if failures is None:
-        failures = []
-    device_ids = {}
-    for nb_device in netbox_devices:
-        device_name = nb_device.get("name")
-        if not device_name:
-            continue
-        name = device_name.lower()
-        try:
-            existing_id = kentik.check_device(name)
-        except RuntimeError as exc:
-            _record_failure(failures, "labels: assign", name, exc)
-            continue
-        if existing_id:
-            device_ids[name] = existing_id
-        else:
-            log.warning("Device %s not found in Kentik; skipping label assignment", name)
-    return device_ids
-
 
 def _label_key(value):
     """Normalize a label's display text into label_cache's lookup key, the
@@ -1094,7 +1247,7 @@ def _prefixed_label_value(source, value):
 
 
 def sync_labels(kentik, netbox_devices, netbox_roles, netbox_tenants, netbox_tags, device_ids,
-                 limit=None, skip_assignment=False, failures=None, label_sources=None):
+                 limit=None, skip_assignment=False, failures=None, label_sources=None, stats=None):
     """Create labels from NetBox metadata and, unless skip_assignment, assign them to devices.
 
     label_sources is an ordered {source: field} dict from parse_label_sources
@@ -1104,25 +1257,39 @@ def sync_labels(kentik, netbox_devices, netbox_roles, netbox_tenants, netbox_tag
     attribute becomes the label's display text, for both creation and the
     device-assignment lookup.
 
-    device_ids may be None, meaning Phase 2 did not just run (e.g. --only
-    labels); in that case each device's Kentik ID is resolved individually
-    right before assignment, after labels have already been created. That
-    resolution (one Kentik read per NetBox device) is skipped entirely when
-    skip_assignment is set, since it would only be needed for assignment.
+    Current device state (for resolving IDs and reading existing label
+    assignments) is read once in bulk via KentikClient.list_devices rather
+    than with a per-device GET; that read happens only if skip_assignment is
+    not set, since it would only be needed for assignment. device_ids may be
+    None, meaning Phase 2 did not just run (e.g. --only labels); in that case
+    each device's Kentik ID is resolved from that same bulk read, right
+    before assignment, after labels have already been created.
 
-    A label create or device label assignment that fails is recorded in
-    failures (if given) and skipped, rather than aborting the whole phase.
+    A label create fails independently per label; a device label assignment
+    fails independently per device. Either is recorded in failures (if
+    given) and skipped, rather than aborting the whole phase. A failure in
+    the bulk device read itself (as opposed to one device's assignment)
+    aborts the whole phase, since without it there's no way to know any
+    device's current state.
+
+    If given, stats is filled in with {"labels_created": N, "labels_unchanged": N,
+    "devices_assigned": N, "devices_unchanged": N} counts for the end-of-run
+    summary; failures aren't duplicated into it since they're already in
+    failures, keyed by phase "labels: create" / "labels: assign".
     """
     log.info("=== Phase 3: Syncing labels ===")
     label_cache = kentik.get_labels()
     created = 0
+    labels_unchanged = 0
     if failures is None:
         failures = []
+    if stats is None:
+        stats = {}
     if label_sources is None:
         label_sources = parse_label_sources(DEFAULT_LABEL_SOURCES_SPEC)
 
     def ensure_within_budget(name, color):
-        nonlocal created
+        nonlocal created, labels_unchanged
         key = name.lower()
         if key not in label_cache and limit is not None and created >= limit:
             log.info("Label limit (%d) reached; skipping label: %s", limit, name)
@@ -1135,6 +1302,8 @@ def sync_labels(kentik, netbox_devices, netbox_roles, netbox_tenants, netbox_tag
             return
         if was_new:
             created += 1
+        else:
+            labels_unchanged += 1
 
     # --- Create labels ---
     # Every label's display text is prefixed with its source type
@@ -1180,16 +1349,33 @@ def sync_labels(kentik, netbox_devices, netbox_roles, netbox_tenants, netbox_tag
 
     # --- Assign labels to devices ---
     if skip_assignment:
+        stats.update({"labels_created": created, "labels_unchanged": labels_unchanged,
+                      "devices_assigned": 0, "devices_unchanged": 0})
         log.info("Skipping device label assignment (--skip-label-assignment)")
         log.info("Phase 3 complete.")
         return
 
+    log.info("Fetching current device state for label assignment...")
+    existing_devices = kentik.list_devices()
+
     if device_ids is None:
         log.info("Resolving device IDs for label assignment...")
-        device_ids = lookup_device_ids(kentik, netbox_devices, failures=failures)
+        device_ids = {}
+        for nb_device in netbox_devices:
+            device_name = nb_device.get("name")
+            if not device_name:
+                continue
+            name = device_name.lower()
+            existing = existing_devices.get(name)
+            if existing:
+                device_ids[name] = existing["id"]
+            else:
+                log.warning("Device %s not found in Kentik; skipping label assignment", name)
 
     log.info("Assigning labels to devices...")
     assigned = 0
+    assignments_set = 0
+    assignments_unchanged = 0
     for nb_device in netbox_devices:
         if limit is not None and assigned >= limit:
             log.info("Device label-assignment limit (%d) reached; stopping further assignments", limit)
@@ -1229,21 +1415,31 @@ def sync_labels(kentik, netbox_devices, netbox_roles, netbox_tenants, netbox_tag
         if not desired:
             continue
 
+        # A device created this run under --dry-run never actually exists in
+        # Kentik, so it won't appear in existing_devices; treat that the same
+        # as a real device with no labels yet.
+        current_labels = [label["id"] for label in (existing_devices.get(name) or {}).get("labels", [])]
+        merged = list(set(current_labels + desired))
+        # Compare via string coercion: in dry-run mode a device's desired
+        # labels can be a mix of real string IDs (already in Kentik) and
+        # negative-int placeholder IDs (would-be-created this run), and
+        # sorted() can't compare int to str directly.
+        if sorted(str(x) for x in merged) == sorted(str(x) for x in current_labels):
+            assigned += 1
+            assignments_unchanged += 1
+            continue
+
+        log.info("Setting labels for %s: %s", name, merged)
         try:
-            existing = kentik.get_device_label_ids(device_id)
-            merged = list(set(existing + desired))
-            # Compare via string coercion: in dry-run mode a device's desired
-            # labels can be a mix of real string IDs (already in Kentik) and
-            # negative-int placeholder IDs (would-be-created this run), and
-            # sorted() can't compare int to str directly.
-            if sorted(str(x) for x in merged) != sorted(str(x) for x in existing):
-                log.info("Setting labels for %s: %s", name, merged)
-                kentik.set_device_labels(device_id, merged)
+            kentik.set_device_labels(device_id, merged)
         except RuntimeError as exc:
             _record_failure(failures, "labels: assign", name, exc)
             continue
         assigned += 1
+        assignments_set += 1
 
+    stats.update({"labels_created": created, "labels_unchanged": labels_unchanged,
+                  "devices_assigned": assignments_set, "devices_unchanged": assignments_unchanged})
     log.info("Phase 3 complete.")
 
 
@@ -1252,6 +1448,7 @@ def sync_labels(kentik, netbox_devices, netbox_roles, netbox_tenants, netbox_tag
 # ---------------------------------------------------------------------------
 
 def main():
+    job_start = time.monotonic()
     cfg = get_config()
 
     if cfg.dry_run:
@@ -1326,11 +1523,19 @@ def main():
     # and recorded here instead of aborting the rest of the run, so a single
     # bad record doesn't block everything else from syncing.
     failures = []
+    summary_rows = []
 
     if run_sites:
+        phase_start = time.monotonic()
+        stats_sites = {}
         site_cache = sync_sites(kentik, netbox_sites, container_prefixes_by_site=site_networks,
                                  limit=cfg.limit, failures=failures,
-                                 site_name_template=cfg.site_name_template)
+                                 site_name_template=cfg.site_name_template, stats=stats_sites)
+        summary_rows.append((
+            "sites", _format_duration(time.monotonic() - phase_start),
+            f"created={stats_sites.get('created', 0)} updated={stats_sites.get('updated', 0)} "
+            f"unchanged={stats_sites.get('unchanged', 0)} failed={_count_failures(failures, 'sites')}",
+        ))
     elif run_devices:
         # Devices still need to resolve existing sites, just without Phase 1's
         # create/update logic running. NetBox device records only carry their
@@ -1346,17 +1551,40 @@ def main():
         site_cache = {}
 
     if run_devices:
+        phase_start = time.monotonic()
+        stats_devices = {}
         device_ids = sync_devices(kentik, netbox_devices, site_cache, plan_id, cfg,
-                                   limit=cfg.limit, failures=failures)
+                                   limit=cfg.limit, failures=failures, stats=stats_devices)
+        summary_rows.append((
+            "devices", _format_duration(time.monotonic() - phase_start),
+            f"created={stats_devices.get('created', 0)} updated={stats_devices.get('updated', 0)} "
+            f"unchanged={stats_devices.get('unchanged', 0)} failed={_count_failures(failures, 'devices')}",
+        ))
     else:
         # None (rather than {}) signals sync_labels to resolve device IDs
         # itself, after labels are created, if it ends up needing them.
         device_ids = None
 
     if run_labels:
+        phase_start = time.monotonic()
+        stats_labels = {}
         sync_labels(kentik, netbox_devices, netbox_roles, netbox_tenants, netbox_tags, device_ids,
                     limit=cfg.limit, skip_assignment=cfg.skip_label_assignment, failures=failures,
-                    label_sources=parse_label_sources(cfg.label_sources))
+                    label_sources=parse_label_sources(cfg.label_sources), stats=stats_labels)
+        summary_rows.append((
+            "labels", _format_duration(time.monotonic() - phase_start),
+            f"labels: created={stats_labels.get('labels_created', 0)} "
+            f"unchanged={stats_labels.get('labels_unchanged', 0)} "
+            f"failed={_count_failures(failures, 'labels: create')}; "
+            f"assignments: set={stats_labels.get('devices_assigned', 0)} "
+            f"unchanged={stats_labels.get('devices_unchanged', 0)} "
+            f"failed={_count_failures(failures, 'labels: assign')}",
+        ))
+
+    summary_rows.append(("total", _format_duration(time.monotonic() - job_start), ""))
+    print()
+    print(format_summary_table(summary_rows))
+    print()
 
     if failures:
         log.error("Sync completed with %d failure(s):", len(failures))
