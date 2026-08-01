@@ -517,6 +517,32 @@ class TestNetboxGetAll:
         assert captured["verify"] is False
 
 
+class TestFetchScopedSite:
+    def test_returns_the_matching_site(self, requests_mock):
+        requests_mock.get(
+            "http://netbox.test/api/dcim/sites/?name=DC1&limit=0",
+            json={"results": [{"id": 2, "name": "DC1"}], "next": None},
+        )
+        site = ns.fetch_scoped_site("http://netbox.test", {}, True, "DC1")
+        assert site == {"id": 2, "name": "DC1"}
+
+    def test_url_encodes_a_name_with_special_characters(self, requests_mock):
+        requests_mock.get(
+            "http://netbox.test/api/dcim/sites/?name=D.%20S.%20Weaver%20Labs&limit=0",
+            json={"results": [{"id": 22, "name": "D. S. Weaver Labs"}], "next": None},
+        )
+        site = ns.fetch_scoped_site("http://netbox.test", {}, True, "D. S. Weaver Labs")
+        assert site["id"] == 22
+
+    def test_raises_a_clean_error_when_not_found(self, requests_mock):
+        requests_mock.get(
+            "http://netbox.test/api/dcim/sites/?name=NoSuchSite&limit=0",
+            json={"results": [], "next": None},
+        )
+        with pytest.raises(RuntimeError, match="NetBox site 'NoSuchSite' not found"):
+            ns.fetch_scoped_site("http://netbox.test", {}, True, "NoSuchSite")
+
+
 # ---------------------------------------------------------------------------
 # KentikClient: dry-run gating
 # ---------------------------------------------------------------------------
@@ -1019,6 +1045,37 @@ class TestLookupDeviceIds:
         device_ids = ns.lookup_device_ids(kentik, [{"id": 1, "name": None}, {"name": "rtr1"}])
         assert device_ids == {"rtr1": "10"}
         kentik.check_device.assert_called_once_with("rtr1")
+
+
+class TestSyncLabelsMixedIdTypes:
+    def test_assignment_does_not_crash_when_ids_mix_str_and_int(self):
+        # Realistic dry-run scenario: one desired label already exists in
+        # Kentik (real string id from get_labels()), another would be newly
+        # created this run (negative int placeholder id from ensure_label's
+        # dry-run path). Comparing/sorting that mix must not raise TypeError.
+        kentik = MagicMock()
+        kentik.get_labels.return_value = {"core": "10", "new-tag": -1}
+        kentik.get_device_label_ids.return_value = ["10"]
+        devices = [{"name": "rtr1", "role": {"slug": "core"}, "tenant": None,
+                    "tags": [{"slug": "new-tag", "name": "new-tag"}]}]
+        ns.sync_labels(kentik, netbox_devices=devices, netbox_roles=[], netbox_tenants=[],
+                        netbox_tags=[], device_ids={"rtr1": "1"}, limit=None)
+        kentik.set_device_labels.assert_called_once()
+        called_id, called_labels = kentik.set_device_labels.call_args[0]
+        assert called_id == "1"
+        assert set(called_labels) == {"10", -1}
+
+    def test_no_update_when_already_matching_despite_mixed_types(self):
+        # Existing labels already have the same mixed-type IDs as desired
+        # (e.g. a placeholder id from a still-pending dry-run site); nothing
+        # should be re-sent, and comparing them must not crash either.
+        kentik = MagicMock()
+        kentik.get_labels.return_value = {"core": -1}
+        kentik.get_device_label_ids.return_value = [-1]
+        devices = [{"name": "rtr1", "role": {"slug": "core"}, "tenant": None, "tags": []}]
+        ns.sync_labels(kentik, netbox_devices=devices, netbox_roles=[], netbox_tenants=[],
+                        netbox_tags=[], device_ids={"rtr1": "1"}, limit=None)
+        kentik.set_device_labels.assert_not_called()
 
 
 class TestSyncLabelsLimit:
@@ -1569,3 +1626,75 @@ class TestEndToEnd:
         label_creates = [r.json()["label"]["name"] for r in requests_mock.request_history
                           if r.method == "POST" and r.path == LABELS_PATH]
         assert set(label_creates) == {"core", "Acme Corp"}  # "prod" excluded: tags dropped from sources
+
+    def test_site_flag_scopes_fetch_and_sync_to_one_site(self, requests_mock, monkeypatch):
+        requests_mock.get(
+            "http://netbox.test/api/dcim/sites/?name=DC1&limit=0",
+            json={"results": [{"id": 2, "name": "DC1"}], "next": None},
+        )
+        requests_mock.get(
+            "http://netbox.test/api/dcim/devices/?site_id=2&limit=0",
+            json={"results": [_make_device("rtr1", site="DC1")], "next": None},
+        )
+        requests_mock.get(
+            "http://netbox.test/api/ipam/prefixes/?status=container&site_id=2&limit=0",
+            json={"results": [], "next": None},
+        )
+        requests_mock.get("http://netbox.test/api/dcim/device-roles/?limit=0", json={"results": [], "next": None})
+        requests_mock.get("http://netbox.test/api/tenancy/tenants/?limit=0", json={"results": [], "next": None})
+        requests_mock.get("http://netbox.test/api/extras/tags/?limit=0", json={"results": [], "next": None})
+        # Deliberately not registering the unfiltered sites/?limit=0 or
+        # devices/?limit=0 endpoints: if --site fell back to an unscoped
+        # fetch, requests_mock would raise NoMockAddress and fail this test.
+
+        _register_kentik_reads(requests_mock)
+        requests_mock.get(f"{KENTIK_BASE}{SITES_PATH}", json={"sites": [{"title": "DC1", "id": "2"}]})
+        requests_mock.post(f"{KENTIK_BASE}{DEVICE_PATH}", json={"device": {"id": "701"}})
+        requests_mock.get(f"{KENTIK_BASE}{device_id_path('701')}", json={"device": {"labels": []}})
+        requests_mock.put(f"{KENTIK_BASE}{device_labels_path('701')}", json={})
+
+        monkeypatch.setattr(sys, "argv", BASE_ARGV + ["--site", "DC1"])
+        ns.main()
+
+        create_calls = [r for r in requests_mock.request_history if r.method == "POST" and r.path == DEVICE_PATH]
+        assert len(create_calls) == 1
+        assert create_calls[0].json()["device"]["deviceName"] == "rtr1"
+
+    def test_site_flag_composes_with_only_devices(self, requests_mock, monkeypatch):
+        requests_mock.get(
+            "http://netbox.test/api/dcim/sites/?name=DC1&limit=0",
+            json={"results": [{"id": 2, "name": "DC1"}], "next": None},
+        )
+        requests_mock.get(
+            "http://netbox.test/api/dcim/devices/?site_id=2&limit=0",
+            json={"results": [_make_device("rtr1", site="DC1")], "next": None},
+        )
+        requests_mock.get(
+            "http://netbox.test/api/ipam/prefixes/?status=container&site_id=2&limit=0",
+            json={"results": [], "next": None},
+        )
+        requests_mock.get("http://netbox.test/api/dcim/device-roles/?limit=0", json={"results": [], "next": None})
+        requests_mock.get("http://netbox.test/api/tenancy/tenants/?limit=0", json={"results": [], "next": None})
+        requests_mock.get("http://netbox.test/api/extras/tags/?limit=0", json={"results": [], "next": None})
+
+        requests_mock.get(check_device_url("rtr1"), status_code=404)
+        requests_mock.get(f"{KENTIK_BASE}{SITES_PATH}", json={"sites": [{"title": "DC1", "id": "2"}]})
+        requests_mock.get(f"{KENTIK_V5}/plans", json={"plans": [{"name": "MyPlan", "id": "9"}]})
+        requests_mock.post(f"{KENTIK_BASE}{DEVICE_PATH}", json={"device": {"id": "701"}})
+        # Deliberately not registering SITES_PATH's POST endpoint or
+        # LABELS_PATH: --only devices must never touch either.
+
+        monkeypatch.setattr(sys, "argv", BASE_ARGV + ["--site", "DC1", "--only", "devices"])
+        ns.main()
+
+        create_calls = [r for r in requests_mock.request_history if r.method == "POST" and r.path == DEVICE_PATH]
+        assert len(create_calls) == 1
+
+    def test_site_flag_exits_cleanly_when_site_not_found(self, requests_mock, monkeypatch):
+        requests_mock.get(
+            "http://netbox.test/api/dcim/sites/?name=NoSuchSite&limit=0",
+            json={"results": [], "next": None},
+        )
+        monkeypatch.setattr(sys, "argv", BASE_ARGV + ["--site", "NoSuchSite"])
+        with pytest.raises(RuntimeError, match="NetBox site 'NoSuchSite' not found"):
+            ns.main()

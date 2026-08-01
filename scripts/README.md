@@ -178,6 +178,7 @@ wins if both are given.
 | `NETBOX_INSECURE_TLS` | `--netbox-insecure-tls` | No | Skip TLS verification on NetBox requests (lab/self-signed instances only) |
 | `KENTIK_SITE_NAME_TEMPLATE` | `--site-name-template` | No (default `{name}`) | Kentik site title template; see [Site naming](#site-naming) |
 | `KENTIK_LABEL_SOURCES` | `--label-sources` | No (default `role:slug,tenant:slug,tag:slug`) | Which NetBox objects become labels, and name vs. slug; see [Label sources](#label-sources) |
+| `KENTIK_SYNC_SITE` | `--site` | No | Scope the run to one NetBox site (exact name match); see [Scoping to a single site](#scoping-to-a-single-site) |
 
 Boolean env vars (`DRY_RUN`, `NETBOX_INSECURE_TLS`) accept `1`, `true`, `yes`, or `on`
 (case-insensitive); anything else is treated as false.
@@ -277,7 +278,9 @@ uv run --env-file .env python scripts/netbox_sync.py --only labels
 
 `--only {sites,devices,labels}` runs just one phase instead of the full
 sites -> devices -> labels pipeline. NetBox data is always fetched in full regardless
-of `--only`; only which Kentik-side phase(s) actually run is affected.
+of `--only` (except for any narrowing `--site` does; see
+[Scoping to a single site](#scoping-to-a-single-site)); only which Kentik-side
+phase(s) actually run is affected.
 
 - **`--only sites`**: create/update sites only. Nothing else runs.
 - **`--only devices`**: create/update devices only. Existing sites are still looked
@@ -300,6 +303,27 @@ NetBox tags/roles/tenants as labels, without re-touching everything else:
 ```bash
 uv run --env-file .env python scripts/netbox_sync.py --only labels --dry-run
 uv run --env-file .env python scripts/netbox_sync.py --only labels
+```
+
+## Scoping to a single site
+
+```bash
+uv run --env-file .env python scripts/netbox_sync.py --site "DM-Akron"
+```
+
+`--site <name>` (or `KENTIK_SYNC_SITE`) restricts the run to one NetBox site
+(exact name match, case sensitive) instead of every site. Only that site, and the
+devices and container prefixes scoped to it, are fetched from NetBox and synced;
+role/tenant/tag labels are still created from the full NetBox inventory (that's
+cheap and idempotent either way), but assignment only ever touches that site's
+devices. If the named site doesn't exist in NetBox, the script exits immediately
+with a clear error instead of silently syncing nothing.
+
+Composes with `--only`, e.g. sync just one site's devices, assuming the site
+itself is already in Kentik:
+
+```bash
+uv run --env-file .env python scripts/netbox_sync.py --site "DM-Akron" --only devices
 ```
 
 ## Skipping label assignment

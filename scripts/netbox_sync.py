@@ -40,6 +40,8 @@ Configuration (env vars or CLI flags):
                         (default: '{name}')
   KENTIK_LABEL_SOURCES  Which NetBox objects become      --label-sources
                         labels, name vs. slug (see below)
+  KENTIK_SYNC_SITE      Scope sync to one NetBox site    --site
+                        (exact name match)
 
 NMS agent detection:
   If a device carries a NetBox tag named 'kentik_primary_agent=<agentId>' it is flagged
@@ -78,8 +80,20 @@ Running a single phase:
                did not just run, each device's Kentik ID is looked up
                individually (one extra read per NetBox device) instead of
                reusing the in-memory result from Phase 2.
-  NetBox data is always fetched in full regardless of --only; only which
-  Kentik-side phase(s) run is affected.
+  NetBox data is always fetched in full regardless of --only (except for any
+  narrowing --site does; see below); only which Kentik-side phase(s) run is
+  affected.
+
+Scoping to a single site:
+  --site <name> restricts the run to one NetBox site (exact name match, case
+  sensitive): only that site, and devices/container-prefixes scoped to it, are
+  fetched from NetBox and synced -- role/tenant/tag labels are still created from
+  the full NetBox inventory (cheap and idempotent either way), but assignment only
+  ever touches that site's devices, since that's all sync_devices/sync_labels see.
+  If the named site doesn't exist in NetBox, the script exits with a clean error
+  rather than silently syncing nothing. Composes with --only, e.g. --site DC1
+  --only devices syncs just that site's devices (the site itself must already
+  exist in Kentik, same as --only devices always requires).
 
 Skipping label assignment:
   --skip-label-assignment creates labels in Kentik as usual but never assigns them to
@@ -145,6 +159,7 @@ import re
 import string
 import sys
 import time
+from urllib.parse import quote
 
 import requests
 import urllib3
@@ -262,6 +277,11 @@ def get_config():
                              "left out entirely is neither created nor assigned "
                              f"(e.g. 'role:slug,tenant:slug' drops tags). Default: "
                              f"'{DEFAULT_LABEL_SOURCES_SPEC}' (today's behavior).")
+    parser.add_argument("--site", default=os.environ.get("KENTIK_SYNC_SITE"),
+                        help="Scope the run to a single NetBox site (exact name match, case "
+                             "sensitive) instead of every site: only that site and its devices "
+                             "are fetched from NetBox and synced. Composes with --only (e.g. "
+                             "--site DC1 --only devices). Default: no scoping, sync everything.")
     cfg = parser.parse_args()
 
     missing = [name for name, attr in [
@@ -362,6 +382,20 @@ def netbox_get_all(url, headers, verify=True):
         results.extend(body.get("results", []))
         next_url = body.get("next")
     return results
+
+
+def fetch_scoped_site(nb_base, nb_headers, nb_verify, site_name):
+    """Look up exactly one NetBox site by exact (case-sensitive) name, for
+    --site scoping. Raises RuntimeError if it doesn't exist, since silently
+    syncing nothing would be far more confusing than a clean error naming
+    the site that couldn't be found.
+    """
+    matches = netbox_get_all(
+        f"{nb_base}/api/dcim/sites/?name={quote(site_name)}&limit=0", nb_headers, verify=nb_verify
+    )
+    if not matches:
+        raise RuntimeError(f"NetBox site '{site_name}' not found (name match is exact and case sensitive)")
+    return matches[0]
 
 
 # ---------------------------------------------------------------------------
@@ -1172,7 +1206,11 @@ def sync_labels(kentik, netbox_devices, netbox_roles, netbox_tenants, netbox_tag
         try:
             existing = kentik.get_device_label_ids(device_id)
             merged = list(set(existing + desired))
-            if sorted(merged) != sorted(existing):
+            # Compare via string coercion: in dry-run mode a device's desired
+            # labels can be a mix of real string IDs (already in Kentik) and
+            # negative-int placeholder IDs (would-be-created this run), and
+            # sorted() can't compare int to str directly.
+            if sorted(str(x) for x in merged) != sorted(str(x) for x in existing):
                 log.info("Setting labels for %s: %s", name, merged)
                 kentik.set_device_labels(device_id, merged)
         except RuntimeError as exc:
@@ -1210,14 +1248,30 @@ def main():
     nb_verify = not cfg.netbox_insecure_tls
 
     log.info("Fetching data from NetBox at %s ...", nb_base)
-    netbox_sites = netbox_get_all(f"{nb_base}/api/dcim/sites/?limit=0", nb_headers, verify=nb_verify)
-    netbox_devices = netbox_get_all(f"{nb_base}/api/dcim/devices/?limit=0", nb_headers, verify=nb_verify)
+    if cfg.site:
+        log.info("Scoping sync to NetBox site: '%s'", cfg.site)
+        scoped_site = fetch_scoped_site(nb_base, nb_headers, nb_verify, cfg.site)
+        netbox_sites = [scoped_site]
+        netbox_devices = netbox_get_all(
+            f"{nb_base}/api/dcim/devices/?site_id={scoped_site['id']}&limit=0", nb_headers, verify=nb_verify
+        )
+        netbox_container_prefixes = netbox_get_all(
+            f"{nb_base}/api/ipam/prefixes/?status=container&site_id={scoped_site['id']}&limit=0",
+            nb_headers, verify=nb_verify,
+        )
+    else:
+        netbox_sites = netbox_get_all(f"{nb_base}/api/dcim/sites/?limit=0", nb_headers, verify=nb_verify)
+        netbox_devices = netbox_get_all(f"{nb_base}/api/dcim/devices/?limit=0", nb_headers, verify=nb_verify)
+        netbox_container_prefixes = netbox_get_all(
+            f"{nb_base}/api/ipam/prefixes/?status=container&limit=0", nb_headers, verify=nb_verify
+        )
+    # Roles/tenants/tags are shared taxonomies, not scoped to a site, so
+    # these are always fetched in full: label creation is cheap and
+    # idempotent regardless of --site, and assignment is already limited to
+    # netbox_devices above.
     netbox_roles = netbox_get_all(f"{nb_base}/api/dcim/device-roles/?limit=0", nb_headers, verify=nb_verify)
     netbox_tenants = netbox_get_all(f"{nb_base}/api/tenancy/tenants/?limit=0", nb_headers, verify=nb_verify)
     netbox_tags = netbox_get_all(f"{nb_base}/api/extras/tags/?limit=0", nb_headers, verify=nb_verify)
-    netbox_container_prefixes = netbox_get_all(
-        f"{nb_base}/api/ipam/prefixes/?status=container&limit=0", nb_headers, verify=nb_verify
-    )
     log.info(
         "NetBox data: %d sites, %d devices, %d roles, %d tenants, %d tags, %d container prefixes",
         len(netbox_sites), len(netbox_devices), len(netbox_roles),
