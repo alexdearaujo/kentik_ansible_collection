@@ -17,10 +17,12 @@ The script runs in three phases, in order:
    from NetBox prefixes; see [Site userAccessNetworks](#site-useraccessnetworks). The
    Kentik site title itself is configurable; see [Site naming](#site-naming).
 2. **Devices**: create or update every NetBox device in Kentik, resolving each
-   device's site, primary IP, and (optionally) NMS agent configuration. Before
-   updating an existing device, its current Kentik state is fetched and compared
-   field by field so the log line for that update names exactly what's changing;
-   see [Device update visibility](#device-update-visibility).
+   device's site, primary IP, and (optionally) NMS agent configuration. Only
+   devices with NetBox status `active` are ever fetched or synced; devices that
+   are offline, planned, staged, decommissioning, etc. are left alone entirely.
+   Before updating an existing device, its current Kentik state is fetched and
+   compared field by field so the log line for that update names exactly what's
+   changing; see [Device update visibility](#device-update-visibility).
 3. **Labels**: create Kentik labels from NetBox device roles, tenants, and tags,
    then assign the relevant labels to each device. Which of those three sources are
    used, and whether each one's name or slug becomes the label text, is configurable;

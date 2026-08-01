@@ -6,7 +6,8 @@
 Execution order:
   1. Sites  – ensure every NetBox site exists in Kentik (create if missing) with
      matching lat/lon and userAccessNetworks (see below).
-  2. Devices – create or update every NetBox device in Kentik.
+  2. Devices – create or update every NetBox device in Kentik. Only devices with
+     NetBox status "active" (NETBOX_DEVICE_STATUS) are ever fetched or synced.
   3. Labels  – create role/tenant/tag labels, then assign them to devices.
 
 Site userAccessNetworks:
@@ -172,6 +173,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger(__name__)
 
 NMS_AGENT_TAG = "kentik_primary_agent"
+
+# Only devices in this NetBox status are ever fetched/synced; change this
+# one place to widen or narrow it instead of editing every fetch call.
+NETBOX_DEVICE_STATUS = "active"
 
 # Fields --site-name-template may reference; see resolve_site_name().
 SITE_NAME_TEMPLATE_FIELDS = (
@@ -1274,7 +1279,8 @@ def main():
         scoped_site = fetch_scoped_site(nb_base, nb_headers, nb_verify, cfg.site)
         netbox_sites = [scoped_site]
         netbox_devices = netbox_get_all(
-            f"{nb_base}/api/dcim/devices/?site_id={scoped_site['id']}&limit=0", nb_headers, verify=nb_verify
+            f"{nb_base}/api/dcim/devices/?status={NETBOX_DEVICE_STATUS}&site_id={scoped_site['id']}&limit=0",
+            nb_headers, verify=nb_verify,
         )
         netbox_container_prefixes = netbox_get_all(
             f"{nb_base}/api/ipam/prefixes/?status=container&site_id={scoped_site['id']}&limit=0",
@@ -1282,7 +1288,9 @@ def main():
         )
     else:
         netbox_sites = netbox_get_all(f"{nb_base}/api/dcim/sites/?limit=0", nb_headers, verify=nb_verify)
-        netbox_devices = netbox_get_all(f"{nb_base}/api/dcim/devices/?limit=0", nb_headers, verify=nb_verify)
+        netbox_devices = netbox_get_all(
+            f"{nb_base}/api/dcim/devices/?status={NETBOX_DEVICE_STATUS}&limit=0", nb_headers, verify=nb_verify
+        )
         netbox_container_prefixes = netbox_get_all(
             f"{nb_base}/api/ipam/prefixes/?status=container&limit=0", nb_headers, verify=nb_verify
         )

@@ -1715,3 +1715,43 @@ class TestEndToEnd:
         monkeypatch.setattr(sys, "argv", BASE_ARGV + ["--site", "NoSuchSite"])
         with pytest.raises(RuntimeError, match="NetBox site 'NoSuchSite' not found"):
             ns.main()
+
+    def test_device_fetch_requests_only_active_status(self, requests_mock, monkeypatch):
+        _register_netbox(requests_mock, devices=[_make_device("rtr1")], sites=[{"name": "DC1"}])
+        _register_kentik_reads(requests_mock)
+        requests_mock.get(f"{KENTIK_BASE}{SITES_PATH}", json={"sites": [{"title": "DC1", "id": "1"}]})
+        requests_mock.post(f"{KENTIK_BASE}{DEVICE_PATH}", json={"device": {"id": "701"}})
+        requests_mock.get(f"{KENTIK_BASE}{device_id_path('701')}", json={"device": {"labels": []}})
+        requests_mock.put(f"{KENTIK_BASE}{device_labels_path('701')}", json={})
+
+        monkeypatch.setattr(sys, "argv", BASE_ARGV)
+        ns.main()
+
+        device_fetch = next(r for r in requests_mock.request_history
+                             if r.hostname == "netbox.test" and r.path == "/api/dcim/devices/")
+        assert device_fetch.qs["status"] == ["active"]
+
+    def test_site_scoped_device_fetch_also_requests_only_active_status(self, requests_mock, monkeypatch):
+        requests_mock.get(
+            "http://netbox.test/api/dcim/sites/?name=DC1&limit=0",
+            json={"results": [{"id": 2, "name": "DC1"}], "next": None},
+        )
+        requests_mock.get(
+            "http://netbox.test/api/dcim/devices/?status=active&site_id=2&limit=0",
+            json={"results": [], "next": None},
+        )
+        requests_mock.get(
+            "http://netbox.test/api/ipam/prefixes/?status=container&site_id=2&limit=0",
+            json={"results": [], "next": None},
+        )
+        requests_mock.get("http://netbox.test/api/dcim/device-roles/?limit=0", json={"results": [], "next": None})
+        requests_mock.get("http://netbox.test/api/tenancy/tenants/?limit=0", json={"results": [], "next": None})
+        requests_mock.get("http://netbox.test/api/extras/tags/?limit=0", json={"results": [], "next": None})
+        # Deliberately not registering a devices URL without status=active:
+        # if the --site path dropped the status filter, requests_mock would
+        # raise NoMockAddress and fail this test.
+        _register_kentik_reads(requests_mock)
+        requests_mock.get(f"{KENTIK_BASE}{SITES_PATH}", json={"sites": [{"title": "DC1", "id": "2"}]})
+
+        monkeypatch.setattr(sys, "argv", BASE_ARGV + ["--site", "DC1"])
+        ns.main()
